@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SepiPanel — نصب خودکار تک‌خطی
-# نصب:    bash <(curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/install.sh)
+# نصب:    bash <(curl -fsSL https://raw.githubusercontent.com/iwasSepi/sepipanel/main/install.sh)
 # آپدیت:  همان دستور بالا را دوباره اجرا کنید (دیتابیس و رمز حفظ می‌شود)
 # حذف:    sepipanel uninstall   (یا: bash <(curl -fsSL .../install.sh) uninstall)
 # منو:    sepipanel
@@ -8,7 +8,7 @@
 set -euo pipefail
 
 # ====== اینجا را با ریپوی خودتان عوض کنید ======
-REPO="${REPO:-USER/REPO}"
+REPO="${REPO:-iwasSepi/sepipanel}"
 BRANCH="${BRANCH:-main}"
 # ===============================================
 

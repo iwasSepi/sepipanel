@@ -151,7 +151,7 @@ do_update() {
   [ -z "$r" ] && { err "Repo info not found ($DIR/.repo)."; return; }
   set -- $r
   echo "Updating from github.com/$1 ($2) ..."
-  bash <(curl -fsSL "https://raw.githubusercontent.com/$1/$2/install.sh")
+  REPO="$1" BRANCH="$2" bash <(curl -fsSL "https://raw.githubusercontent.com/$1/$2/install.sh")
 }
 
 do_uninstall() {
