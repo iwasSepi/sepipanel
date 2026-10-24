@@ -1169,7 +1169,7 @@ def state():
     return jsonify(
         inbounds=[ser_inbound(r, ups) for r in q("SELECT * FROM inbounds ORDER BY id")],
         clients=[ser_client(c) for c in q("SELECT * FROM clients ORDER BY id DESC")],
-        settings=dict(public_url=setting("public_url"), sub_title=setting("sub_title", "WireGuard"),
+        settings=dict(public_url=setting("public_url"), sub_title=setting("sub_title", "WireGuard"), sub_telegram=setting("sub_telegram", ""),
                       update_interval=int(setting("update_interval", "12") or 12)),
         defaults=inbound_defaults(), panel=panel_info(),
         server=dict(wg=(ver.strip() if rc2 == 0 else ""), awg=(aver.strip() if rc3 == 0 else ""), nat_iface=detect_iface(), qr=bool(qrcode),
@@ -1333,6 +1333,10 @@ def settings_save():
         raise Err("آدرس پنل باید با http:// یا https:// شروع شود")
     set_setting("public_url", u)
     set_setting("sub_title", oneline(d.get("sub_title")) or "WireGuard")
+    tgv = re.sub(r"^(https?://)?(t\.me/|telegram\.me/)?@?", "", str(d.get("sub_telegram", "")).strip()).strip("/")
+    if tgv and not re.fullmatch(r"[A-Za-z0-9_]{3,64}", tgv):
+        raise Err("آیدی تلگرام فقط شامل حرف انگلیسی، عدد و _ باشد (مثلاً sepiamDigee)")
+    set_setting("sub_telegram", tgv)
     set_setting("update_interval", num(d.get("update_interval"), 12, 1, 720, "بازه آپدیت"))
     return jsonify(ok=True)
 
@@ -1357,62 +1361,302 @@ def qr_svg(text):
     return Response(buf.getvalue(), mimetype="image/svg+xml", headers={"Cache-Control": "no-store"})
 
 
+def qr_data_uri(text):
+    if not qrcode:
+        return ""
+    try:
+        img = qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, box_size=8, border=2)
+        buf = io.BytesIO(); img.save(buf)
+        return "data:image/svg+xml;base64," + base64.b64encode(buf.getvalue()).decode()
+    except Exception:
+        return ""
+
+
 def fmt_b(n):
     n = float(n or 0)
     for u in ("B", "KB", "MB", "GB", "TB"):
         if n < 1024 or u == "TB":
-            return f"{n:.2f} {u}" if u != "B" else f"{int(n)} B"
+            if u == "B":
+                return f"{int(n)} B"
+            return f"{n:.2f}".rstrip("0").rstrip(".") + f" {u}"
         n /= 1024
 
 
-SUB_CSS = """:root{color-scheme:dark}body{margin:0;font:15px/1.7 Vazirmatn,IRANSans,Tahoma,sans-serif;background:#0a1120;color:#e8eef9}
-.w{max-width:720px;margin:0 auto;padding:24px 14px 60px}h1{font-size:22px;margin:6px 0 2px}
-.m{color:#8b9cb8;font-size:13px}.bar{height:8px;background:#1b2a47;border-radius:4px;overflow:hidden;margin:10px 0}
-.bar i{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa)}.c{background:#101a2e;border:1px solid #1b2840;border-radius:14px;padding:16px;margin-top:14px}
-pre{direction:ltr;text-align:left;background:#0a1322;border:1px solid #1b2840;color:#cfe0ff;border-radius:10px;padding:12px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
-img{box-sizing:border-box;width:220px;max-width:100%;background:#fff;padding:10px;border-radius:12px;display:block;margin:10px auto}a.b,button{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:9px;padding:8px 16px;font:inherit;text-decoration:none;cursor:pointer;margin:2px 0 2px 6px}
-a.b:hover,button:hover{background:#1d4ed8}
-code{direction:ltr;unicode-bidi:embed;word-break:break-all}.bad{color:#f87171;font-weight:700}"""
+def g2j(gy, gm, gd):
+    """میلادی به شمسی"""
+    gdm = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+    if gy > 1600:
+        jy = 979; gy -= 1600
+    else:
+        jy = 0; gy -= 621
+    gy2 = gy + 1 if gm > 2 else gy
+    days = 365 * gy + (gy2 + 3) // 4 - (gy2 + 99) // 100 + (gy2 + 399) // 400 - 80 + gd + gdm[gm - 1]
+    jy += 33 * (days // 12053); days %= 12053
+    jy += 4 * (days // 1461); days %= 1461
+    if days > 365:
+        jy += (days - 1) // 365; days = (days - 1) % 365
+    if days < 186:
+        jm = 1 + days // 31; jd = 1 + days % 31
+    else:
+        jm = 7 + (days - 186) // 30; jd = 1 + (days - 186) % 30
+    return jy, jm, jd
+
+
+def jalali_str(ts):
+    lt = time.localtime(ts)
+    jy, jm, jd = g2j(lt.tm_year, lt.tm_mon, lt.tm_mday)
+    return f"{jy}/{jm:02d}/{jd:02d}", time.strftime("%H:%M", lt)
+
+
+def ago_fa(ts):
+    if not ts:
+        return "هنوز متصل نشده‌اید"
+    d = max(0, now() - ts)
+    if d < 180:
+        return "هم‌اکنون"
+    if d < 3600:
+        return f"{d // 60} دقیقه پیش"
+    if d < 86400:
+        return f"{d // 3600} ساعت پیش"
+    return f"{d // 86400} روز پیش"
+
+
+def tg_id():
+    return re.sub(r"[^A-Za-z0-9_]", "", setting("sub_telegram", ""))
+
+
+_IC = {
+    "shield": '<path d="M12 3l7 3v5c0 5-3.2 8.4-7 10-3.8-1.6-7-5-7-10V6z"/><path d="M9 12l2 2 4-4"/>',
+    "shieldx": '<path d="M12 3l7 3v5c0 5-3.2 8.4-7 10-3.8-1.6-7-5-7-10V6z"/><path d="M9.5 9.5l5 5M14.5 9.5l-5 5"/>',
+    "signal": '<path d="M5 20v-4M10 20v-8M15 20V8M20 20V4"/>',
+    "db": '<ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>',
+    "up": '<circle cx="12" cy="12" r="9"/><path d="M12 16V8M8.5 11.5L12 8l3.5 3.5"/>',
+    "down": '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8.5 12.5L12 16l3.5-3.5"/>',
+    "box": '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/>',
+    "cal": '<rect x="4" y="5" width="16" height="15" rx="3"/><path d="M8 3v4M16 3v4M4 10h16"/>',
+    "clock": '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+    "link": '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3A4 4 0 0 0 11 18.7l1-1"/>',
+    "copy": '<rect x="8" y="8" width="12" height="12" rx="3"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"/>',
+    "qr": '<rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><path d="M14 14h2v2h-2zM18 14h2v2M14 18h2v2M18 18h2v2"/>',
+    "dl": '<path d="M12 4v11M7.5 11L12 15.5 16.5 11M5 20h14"/>',
+    "plus": '<circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>',
+    "arrow": '<path d="M19 12H5M11 6l-6 6 6 6"/>',
+    "file": '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h6"/>',
+    "code": '<path d="M8 8l-4 4 4 4M16 8l4 4-4 4M13.5 6l-3 12"/>',
+    "tg": '<path d="M21 4L3 11l6 2 2 6 3-4 5 3z"/>',
+    "net": '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c3 3 3 15 0 18M12 3c-3 3-3 15 0 18"/>',
+}
+
+
+def _ic(n):
+    return ('<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" '
+            f'stroke-linecap="round" stroke-linejoin="round">{_IC[n]}</svg>')
+
+
+SUB_LOGO = ('<svg viewBox="0 0 64 64" width="46" height="46"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1">'
+            '<stop offset="0" stop-color="#7aa2ff"/><stop offset="1" stop-color="#6a3df0"/></linearGradient></defs>'
+            '<path d="M32 4L8 14v16c0 15 10 25 24 30 14-5 24-15 24-30V14z" fill="url(#lg)"/>'
+            '<path d="M45 19L21 30l8.5 3.2L33 44l5-8 7 2.2z" fill="#0b1330"/></svg>')
+
+SUB_BG = ('<svg class="bgm" viewBox="0 0 560 340" preserveAspectRatio="xMidYMin slice" aria-hidden="true"><defs>'
+          '<linearGradient id="sk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#141a46"/>'
+          '<stop offset=".55" stop-color="#5a4686"/><stop offset=".82" stop-color="#e0805f" stop-opacity=".8"/>'
+          '<stop offset="1" stop-color="#070d1c" stop-opacity="0"/></linearGradient>'
+          '<radialGradient id="sn" cx=".5" cy=".5" r=".5"><stop offset="0" stop-color="#ffd9a0"/>'
+          '<stop offset="1" stop-color="#ffb070" stop-opacity="0"/></radialGradient>'
+          '<linearGradient id="fd" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#070d1c" stop-opacity="0"/>'
+          '<stop offset="1" stop-color="#070d1c"/></linearGradient></defs>'
+          '<rect width="560" height="340" fill="url(#sk)"/><circle cx="430" cy="236" r="70" fill="url(#sn)"/>'
+          '<path d="M0 250l60-52 40 30 70-80 60 70 50-40 70 66 55-50 60 62 40-34 55 52v96H0z" fill="#161b3f" opacity=".85"/>'
+          '<path d="M0 290l80-46 60 38 80-62 70 58 70-48 80 60 60-44 60 50v94H0z" fill="#0c1230"/>'
+          '<rect y="200" width="560" height="140" fill="url(#fd)"/></svg>')
+
+SUB_CSS = r""":root{color-scheme:dark;--bg:#070d1c;--card:rgba(15,24,50,.74);--line:rgba(130,160,255,.16);--tx:#eaf0ff;--mut:#8fa0c4;--ac:#4f7cff;--ac2:#7a5cff;--ok:#34d399;--warn:#fbbf24;--bad:#f87171}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}html{background:var(--bg)}
+body{margin:0;min-height:100vh;font:15px/1.7 Vazirmatn,Vazir,IRANSans,"Segoe UI",Tahoma,system-ui,sans-serif;color:var(--tx);position:relative;overflow-x:hidden;
+background:radial-gradient(110% 50% at 50% 0,#1d2358 0,#0d1533 42%,var(--bg) 75%)}
+.bgm{position:absolute;top:0;left:0;width:100%;height:340px;z-index:0;pointer-events:none}
+.w{position:relative;z-index:1;max-width:580px;margin:0 auto;padding:24px 14px 36px}
+.logo{display:flex;align-items:center;justify-content:center;gap:10px;direction:ltr;margin-top:8px}
+.logo b{font:700 40px/1 "Segoe UI",system-ui,sans-serif;letter-spacing:-1.5px}.logo b span{color:#5b8cff}
+.tag{text-align:center;color:#c3cdea;font-size:13px;letter-spacing:.6px;direction:ltr;margin-top:6px}
+.hi{text-align:center;margin:34px 0 2px;font-size:19px;font-weight:800}
+.hs{text-align:center;color:var(--mut);font-size:13px}
+.who{display:flex;justify-content:center;margin-top:8px}.who span{background:rgba(79,124,255,.14);border:1px solid var(--line);border-radius:999px;padding:2px 14px;font-size:13px;color:#c9d6ff}
+.card{background:var(--card);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:20px;padding:16px;margin-top:14px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+.i{width:20px;height:20px;flex:none}
+.ct{display:flex;align-items:center;gap:8px;font-weight:700;margin-bottom:12px}.ct .i{color:#6f94ff}.ct em{margin-inline-start:auto;font-style:normal;font-size:12px;color:var(--mut);font-weight:400}
+.stt{display:flex;align-items:center;gap:14px}
+.sh{width:62px;height:62px;border-radius:50%;display:grid;place-items:center;flex:none;color:var(--ok);background:rgba(52,211,153,.1);border:2px solid rgba(52,211,153,.35);box-shadow:0 0 28px rgba(52,211,153,.18)}
+.sh .i{width:32px;height:32px}.sh.bad{color:var(--bad);background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.35);box-shadow:0 0 28px rgba(248,113,113,.18)}
+.stt h3{margin:0;font-size:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}.stt p{margin:2px 0 0;color:var(--mut);font-size:13px;line-height:1.6}
+.bd{font-size:12px;font-weight:700;padding:1px 12px;border-radius:999px;background:rgba(52,211,153,.16);color:var(--ok)}.bd.bad{background:rgba(248,113,113,.16);color:var(--bad)}.bd.warn{background:rgba(251,191,36,.16);color:var(--warn)}
+.sig{margin-inline-start:auto;width:42px;height:42px;border-radius:12px;display:grid;place-items:center;color:var(--ok);background:rgba(52,211,153,.08);flex:none}.sig.bad{color:var(--mut);background:rgba(143,160,196,.08)}
+.bar{height:10px;border-radius:6px;background:rgba(120,150,255,.14);overflow:hidden}.bar i{display:block;height:100%;border-radius:6px;background:linear-gradient(90deg,#3b6cf6,#6f94ff);transition:width .8s}
+.bar.w1 i{background:linear-gradient(90deg,#d99a06,#fbbf24)}.bar.w2 i{background:linear-gradient(90deg,#dc3b3b,#f87171)}.bar.inf i{opacity:.35;background:repeating-linear-gradient(135deg,#3b6cf6 0 10px,#5b86ff 10px 20px)}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.sc{min-width:0}.sc .v{display:flex;align-items:center;gap:6px;font-weight:700;font-size:15px;white-space:nowrap}.sc .v .i{color:#6f94ff;width:18px;height:18px}.sc small{display:block;color:var(--mut);font-size:12px;margin-top:0}
+.ud{display:flex;justify-content:space-between;gap:8px;margin-top:12px;padding-top:10px;border-top:1px dashed var(--line);font-size:12.5px;color:var(--mut)}.ud b{color:var(--tx)}
+.ex{display:flex;align-items:center;gap:12px}.exi{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;background:rgba(79,124,255,.14);color:#8aa9ff;flex:none}.exi .i{width:24px;height:24px}
+.ex h4{margin:0;font-size:15px}.ex p{margin:0;color:var(--mut);font-size:13.5px;direction:ltr;text-align:right;white-space:nowrap}
+.dl{flex:none;margin-inline-start:auto;display:flex;align-items:center;gap:6px;background:rgba(79,124,255,.14);color:#9db6ff;border:1px solid var(--line);padding:4px 10px;border-radius:12px;font-size:12.5px;white-space:nowrap}.dl .i{width:16px;height:16px}.dl b{font-size:16px;color:#fff}
+.dl.warn{color:var(--warn);background:rgba(251,191,36,.1)}.dl.bad{color:var(--bad);background:rgba(248,113,113,.1)}
+.lk{display:flex;gap:8px;align-items:stretch}
+.box{flex:1;min-width:0;direction:ltr;text-align:left;background:rgba(6,12,30,.7);border:1px solid var(--line);border-radius:12px;padding:10px 12px;font:12.5px/1.5 ui-monospace,Consolas,monospace;color:#cfe0ff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;border:1px solid var(--line);background:rgba(79,124,255,.12);color:#dbe5ff;border-radius:12px;padding:9px 14px;font:inherit;font-size:13.5px;cursor:pointer;text-decoration:none;white-space:nowrap;transition:.15s}
+.btn:hover{background:rgba(79,124,255,.24)}.btn:active{transform:scale(.97)}.btn .i{width:18px;height:18px}
+.btn.p{background:linear-gradient(90deg,#3b6cf6,#6f55f0);border-color:transparent;color:#fff;box-shadow:0 6px 20px rgba(79,100,255,.35)}.btn.p:hover{filter:brightness(1.1)}
+.btn.sq{padding:9px 12px}.btn.big{width:100%;padding:13px 16px;font-size:15px;margin-top:12px;justify-content:space-between}
+.apps{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:12px}
+.app{display:flex;flex-direction:column;align-items:center;gap:5px;padding:10px 2px;border-radius:14px;border:1px solid var(--line);background:rgba(10,18,42,.6);color:#cfd9f5;text-decoration:none;font-size:11px;min-width:0;transition:.15s}
+.app:hover{background:rgba(79,124,255,.16)}.app i{width:30px;height:30px;border-radius:9px;display:grid;place-items:center;font:700 14px/1 "Segoe UI",sans-serif;font-style:normal;color:#fff}
+.qrb{display:none;margin-top:12px;text-align:center}.qrb.open{display:block}.qrb img{width:230px;max-width:100%;background:#fff;padding:12px;border-radius:16px;box-shadow:0 8px 30px rgba(0,0,0,.4)}.qrb small{display:block;color:var(--mut);margin-top:8px}
+.ibh{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.ibh h3{margin:0;font-size:16px}.ibh small{color:var(--mut)}
+.tg2{font-size:11px;padding:0 10px;border-radius:999px;background:rgba(122,92,255,.18);color:#b9a8ff;border:1px solid rgba(122,92,255,.3)}
+.inf2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.inf2 div{background:rgba(6,12,30,.5);border:1px solid var(--line);border-radius:12px;padding:6px 10px;min-width:0}
+.inf2 small{display:block;color:var(--mut);font-size:11.5px;direction:ltr;text-align:left}.inf2 b{display:block;direction:ltr;text-align:left;font:600 12.5px ui-monospace,Consolas,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acts{display:flex;gap:8px;flex-wrap:wrap}.acts .btn{flex:1 1 auto}
+details{margin-top:12px;border:1px solid var(--line);border-radius:12px;background:rgba(6,12,30,.45)}details summary{cursor:pointer;padding:10px 12px;font-size:13.5px;color:#c9d6ff;display:flex;align-items:center;gap:8px;list-style:none}
+details summary::-webkit-details-marker{display:none}details summary .i{width:18px;height:18px;color:#6f94ff}details summary:after{content:"";margin-inline-start:auto;width:8px;height:8px;border-inline-end:2px solid var(--mut);border-bottom:2px solid var(--mut);transform:rotate(45deg);transition:.2s}details[open] summary:after{transform:rotate(-135deg)}
+pre{direction:ltr;text-align:left;margin:0;padding:12px;border-top:1px solid var(--line);color:#cfe0ff;font:12.5px/1.55 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all;max-height:300px;overflow:auto;user-select:all}
+.dc{padding:0 12px 12px}.dc .btn{width:100%;margin-top:10px}
+.warnb{margin-top:10px;font-size:12.5px;color:#fcd98a;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.22);border-radius:12px;padding:8px 12px}
+.off{text-align:center;color:var(--mut)}.off p{margin:4px 0 0}
+.ft{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:26px;color:var(--mut);font-size:12px;text-decoration:none}
+.ft .c{width:42px;height:42px;border-radius:50%;background:#2aa1e6;display:grid;place-items:center;color:#fff;flex:none}.ft .c .i{width:22px;height:22px;fill:#fff}
+.ft b{display:block;color:var(--tx);font-size:16px;direction:ltr;text-align:right;font-weight:600}
+.cr{text-align:center;color:#56648a;font-size:11px;margin-top:18px;direction:ltr}
+#toast{position:fixed;left:50%;bottom:28px;transform:translate(-50%,30px);background:#1a2650;border:1px solid var(--line);color:#fff;padding:9px 20px;border-radius:999px;font-size:13.5px;opacity:0;pointer-events:none;transition:.25s;z-index:9}#toast.show{opacity:1;transform:translate(-50%,0)}
+@media(max-width:400px){.logo b{font-size:34px}.g3{gap:4px}.sc .v{font-size:13.5px}.lk{flex-wrap:wrap}.lk .box{flex-basis:100%}.lk .btn{flex:1}}"""
+
+SUB_JS = r"""function T(m){var t=document.getElementById('toast');t.textContent=m;t.className='show';clearTimeout(window._t);window._t=setTimeout(function(){t.className=''},1800)}
+function cp(id){var t=document.getElementById(id).textContent;
+if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(function(){T('کپی شد ✓')},fb)}else fb();
+function fb(){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity=0;document.body.appendChild(a);a.select();try{document.execCommand('copy');T('کپی شد ✓')}catch(e){T('کپی نشد؛ دستی انتخاب کنید')}a.remove()}}
+function qt(id){document.getElementById(id).classList.toggle('open')}"""
+
+_APPS = [("Hiddify", "H", "#3b82f6,#6366f1", "hiddify://import/{u}#{n}"),
+         ("sing-box", "S", "#14b8a6,#0ea5e9", "sing-box://import-remote-profile?url={q}#{n}"),
+         ("v2rayNG", "V", "#8b5cf6,#d946ef", "v2rayng://install-sub?url={q}&name={n}"),
+         ("Streisand", "St", "#f59e0b,#ef4444", "streisand://import/{u}"),
+         ("NekoBox", "N", "#ec4899,#f43f5e", "sn://subscription?url={q}&name={n}")]
 
 
 def sub_page(c, items, base):
     E = html.escape
-    used = c["up_bytes"] + c["down_bytes"]
+    used = (c["up_bytes"] or 0) + (c["down_bytes"] or 0)
+    lim = c["limit_bytes"] or 0
     st = client_state(c)
-    pct = min(100, used * 100 / c["limit_bytes"]) if c["limit_bytes"] else 0
-    exp = time.strftime("%Y-%m-%d", time.localtime(c["expiry"])) if c["expiry"] else "نامحدود"
     tok = c["token"]
-    h = [f"<!doctype html><html lang=fa dir=rtl><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         f"<title>{E(c['name'])}</title><style>{SUB_CSS}</style></head><body><div class=w>",
-         f"<h1>{E(c['name'])}</h1><div class=m>{E(setting('sub_title', 'WireGuard'))}</div>"]
-    if st != "active":
-        h.append(f"<p class=bad>این اشتراک فعال نیست ({ {'expired': 'منقضی شده', 'limit': 'حجم تمام شده'}.get(st, 'غیرفعال') }).</p>")
-    h.append(f"<div class=c><div class=m>مصرف: <b>{fmt_b(used)}</b> از <b>{fmt_b(c['limit_bytes']) if c['limit_bytes'] else 'نامحدود'}</b>"
-             f" &nbsp;|&nbsp; انقضا: <b>{exp}</b></div>")
-    if c["limit_bytes"]:
-        h.append(f"<div class=bar><i style='width:{pct:.1f}%'></i></div>")
     sub = f"{base}/sub/{tok}"
-    h.append(f"<div class=m style='margin-top:8px'>لینک ساب (برای Hiddify / v2rayN / NekoBox / sing-box):</div>"
-             f"<pre id=sl>{E(sub)}</pre><button onclick=\"cp('sl')\">کپی لینک ساب</button></div>")
-    if qrcode:
-        h.append(f"<div class=c><img src='/sub/{tok}/link.svg' alt=QR></div>")
-    if st == "active":
+    title = setting("sub_title", "WireGuard")
+    tg = tg_id()
+    active = st == "active"
+    online = active and c["last_seen"] and now() - c["last_seen"] < 180
+
+    # --- وضعیت ---
+    if active:
+        badge, bcls = "فعال", ""
+        msg = ("شما در حال حاضر به اینترنت متصل هستید." if online
+               else f"اشتراک شما فعال است · آخرین اتصال: {ago_fa(c['last_seen'])}")
+    else:
+        badge, bcls = {"expired": ("منقضی شده", "bad"), "limit": ("حجم تمام شده", "bad")}.get(st, ("غیرفعال", "bad"))
+        msg = {"expired": "مدت اشتراک شما به پایان رسیده است.",
+               "limit": "حجم اشتراک شما تمام شده است."}.get(st, "اشتراک شما توسط مدیر غیرفعال شده است.")
+    # --- حجم ---
+    pct = min(100.0, used * 100 / lim) if lim else 0.0
+    bc = "inf" if not lim else ("w2" if pct >= 90 else "w1" if pct >= 70 else "")
+    left = max(0, lim - used) if lim else 0
+    ltr = lambda s: f"<span dir='ltr'>{E(s)}</span>"
+    ic_s = lambda n: _ic(n).replace('class="i"', 'class="i" style="width:14px;height:14px;vertical-align:-2px"')
+    # --- انقضا ---
+    if c["expiry"]:
+        jd, jt = jalali_str(c["expiry"])
+        days = -(-(c["expiry"] - now()) // 86400)
+        if days <= 0:
+            dchip, dcls = "منقضی شده", "bad"
+        else:
+            dchip, dcls = f"<b>{days}</b> روز مانده", ("bad" if days <= 3 else "warn" if days <= 7 else "")
+        ex_html = f"<h4>تاریخ انقضا</h4><p>{jd} · {jt}</p>"
+    else:
+        dchip, dcls, ex_html = "بدون محدودیت زمانی", "", "<h4>تاریخ انقضا</h4><p style='direction:rtl'>نامحدود</p>"
+
+    h = ["<!doctype html><html lang='fa' dir='rtl'><head><meta charset='utf-8'>",
+         "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'><meta name='theme-color' content='#070d1c'>",
+         f"<title>{E(c['name'])} — Sepi-panel</title><style>{SUB_CSS}</style></head><body>{SUB_BG}<div class='w'>",
+         f"<div class='logo'>{SUB_LOGO}<b>Sepi<span>-panel</span></b></div><div class='tag'>Fast &nbsp;·&nbsp; Stable &nbsp;·&nbsp; Secure</div>",
+         "<div class='hi'>به پنل کاربری سپی خوش آمدید</div>",
+         f"<div class='hs'>{E(title)} · اتصال پایدار، تجربه‌ای بهتر</div>",
+         f"<div class='who'><span>{E(c['name'])}</span></div>",
+         f"<section class='card'><div class='stt'><div class='sh {bcls}'>{_ic('shield' if active else 'shieldx')}</div>"
+         f"<div><h3>وضعیت اتصال <span class='bd {bcls}'>{badge}</span></h3><p>{E(msg)}</p></div>"
+         f"<div class='sig {'' if online else 'bad'}'>{_ic('signal')}</div></div></section>",
+         f"<section class='card'><div class='ct'>{_ic('db')}<span>حجم مصرفی</span><em dir='ltr'>{pct:.0f}%</em></div>"
+         f"<div class='bar {bc}'><i style='width:{(pct if lim else 100):.1f}%'></i></div>"
+         "<div class='g3'>"
+         f"<div class='sc'><div class='v'>{_ic('box')}<b>{ltr(fmt_b(lim)) if lim else 'نامحدود'}</b></div><small>کل حجم</small></div>"
+         f"<div class='sc'><div class='v'>{_ic('db')}<b>{ltr(fmt_b(left)) if lim else '∞'}</b></div><small>باقی مانده</small></div>"
+         f"<div class='sc'><div class='v'>{_ic('up')}<b>{ltr(fmt_b(used))}</b></div><small>مصرف شده</small></div></div>"
+         f"<div class='ud'><span>{ic_s('down')} دانلود: <b>{ltr(fmt_b(c['down_bytes']))}</b></span>"
+         f"<span>{ic_s('up')} آپلود: <b>{ltr(fmt_b(c['up_bytes']))}</b></span></div></section>",
+         f"<section class='card'><div class='ex'><div class='exi'>{_ic('cal')}</div><div>{ex_html}</div>"
+         f"<div class='dl {dcls}'>{_ic('clock')}<span>{dchip}</span></div></div></section>"]
+
+    if not active:
+        h.append("<section class='card off'><b>برای تمدید یا فعال‌سازی با پشتیبانی در ارتباط باشید.</b>"
+                 + (f"<p>تلگرام: <span dir='ltr'>@{E(tg)}</span></p>" if tg else "") + "</section>")
+    else:
+        # --- لینک ساب ---
+        qs = qr_data_uri(sub)
+        nm = quote(f"{title}-{c['name']}")
+        apps = "".join(
+            f"<a class='app' href='{E(a[3].format(u=sub, q=quote(sub, safe=''), n=nm))}'><i style='background:linear-gradient(135deg,{a[2]})'>{a[1]}</i>{a[0]}</a>"
+            for a in _APPS)
+        h.append(f"<section class='card'><div class='ct'>{_ic('link')}<span>لینک اشتراک (Subscription)</span></div>"
+                 f"<div class='lk'><div class='box' id='sl'>{E(sub)}</div>"
+                 f"<button class='btn p' onclick=\"cp('sl')\">{_ic('copy')}کپی</button>"
+                 + (f"<button class='btn sq' onclick=\"qt('qs')\" aria-label='QR'>{_ic('qr')}</button>" if qs else "")
+                 + "</div>"
+                 + (f"<div class='qrb' id='qs'><img src='{qs}' alt='QR'><small>با اپ کلاینت اسکن کنید تا اشتراک اضافه شود</small></div>" if qs else "")
+                 + f"<div class='apps'>{apps}</div>"
+                 f"<a class='btn p big' href='{E(_APPS[0][3].format(u=sub, q=quote(sub, safe=''), n=nm))}'>"
+                 f"<span style='display:flex;gap:8px;align-items:center'>{_ic('plus')}افزودن به کلاینت</span>{_ic('arrow')}</a>"
+                 "<div class='warnb' style='margin-top:12px'>این لینک را برای دیگران ارسال نکنید؛ با آن می‌توان از اشتراک شما استفاده کرد.</div></section>")
+        # --- کانفیگ‌ها ---
         for i, (ci, ib) in enumerate(items):
             conf = build_conf(c, ci, ib)
-            uri = "" if is_awg(ib) else build_uri(c, ci, ib)
-            h.append(f"<div class=c><b>{E(ib['name'])}</b> <span class=m>{E(ib['remark'])}</span>"
-                     f"<pre id=cf{i}>{E(conf)}</pre>")
-            if qrcode:
-                h.append(f"<img src='/sub/{tok}/{ib['id']}.svg' alt=QR>")
-            if is_awg(ib):
-                h.append("<div class=m>این اینباند AmneziaWG است؛ فقط با اپ AmneziaWG (فایل .conf یا QR) کار می‌کند.</div>")
-            h.append(f"<a class=b href='/sub/{tok}/{ib['id']}.conf'>دانلود .conf</a>"
-                     f"<button onclick=\"cp('cf{i}')\">کپی کانفیگ</button>"
-                     + ("" if is_awg(ib) else f"<button onclick=\"cp('u{i}')\">کپی لینک wireguard://</button>"
-                        f"<pre id=u{i} style='display:none'>{E(uri)}</pre>") + "</div>")
-    h.append("<script>function cp(i){var t=document.getElementById(i).innerText;if(navigator.clipboard&&isSecureContext)navigator.clipboard.writeText(t);"
-             "else{var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}"
-             "alert('کپی شد')}</script></div></body></html>")
+            awg = is_awg(ib)
+            uri = "" if awg else build_uri(c, ci, ib)
+            addr, dns, mtu, ka, allowed = link_params(ci, ib)
+            qc = qr_data_uri(conf)
+            info = [("Endpoint", endpoint_str(ib)), ("IP", addr.split(",")[0].strip())]
+            if dns:
+                info.append(("DNS", dns))
+            if mtu:
+                info.append(("MTU", str(mtu)))
+            cells = "".join(f"<div><small>{k}</small><b>{E(v)}</b></div>" for k, v in info)
+            h.append(f"<section class='card'><div class='ibh'><h3>{E(ib['name'])}</h3>"
+                     f"<span class='tg2'>{'AmneziaWG' if awg else 'WireGuard'}</span>"
+                     + (f"<small>{E(ib['remark'])}</small>" if ib["remark"] else "") + "</div>"
+                     f"<div class='inf2'>{cells}</div><div class='acts'>"
+                     f"<a class='btn p' href='/sub/{tok}/{ib['id']}.conf'>{_ic('dl')}فایل کانفیگ <span dir='ltr'>(.conf)</span></a>"
+                     f"<button class='btn' onclick=\"cp('cf{i}')\">{_ic('copy')}کپی کانفیگ</button>"
+                     + (f"<button class='btn' onclick=\"cp('u{i}')\">{_ic('link')}کپی لینک کانفیگ</button>" if uri else "")
+                     + (f"<button class='btn' onclick=\"qt('q{i}')\">{_ic('qr')}QR کد</button>" if qc else "")
+                     + "</div>"
+                     + (f"<div class='qrb' id='q{i}'><img src='{qc}' alt='QR'><small>در اپ WireGuard"
+                        f"{' / AmneziaWG' if awg else ''} اسکن کنید</small></div>" if qc else "")
+                     + (f"<details><summary>{_ic('link')}لینک کانفیگ <span dir='ltr'>(wireguard://)</span></summary><pre id='u{i}'>{E(uri)}</pre></details>" if uri else "")
+                     + f"<details><summary>{_ic('code')}متن کامل کانفیگ</summary><pre id='cf{i}'>{E(conf)}</pre></details>"
+                     + ("<div class='warnb'>این اینباند AmneziaWG است؛ فقط با اپ AmneziaWG (فایل .conf یا QR) کار می‌کند و در لینک ساب قرار نمی‌گیرد.</div>" if awg else "")
+                     + "</section>")
+        if not items:
+            h.append("<section class='card off'>هنوز کانفیگی به اشتراک شما اضافه نشده است.</section>")
+
+    if tg:
+        h.append(f"<a class='ft' href='https://t.me/{E(tg)}' target='_blank' rel='noopener'><div class='c'>{_ic('tg')}</div>"
+                 f"<div>کانال تلگرام ما را دنبال کنید<b>@{E(tg)}</b></div></a>")
+    h.append(f"<div class='cr'>Sepi-panel</div></div><div id='toast'></div><script>{SUB_JS}</script></body></html>")
     return "".join(h)
 
 
@@ -1759,10 +2003,11 @@ ${p.restart_needed?`<div class="card" style="border-inline-start:4px solid var(-
 <div class="card"><div class="ch">${ic('link')}تنظیمات اشتراک</div>
  <div class="fg"><label>آدرس عمومی پنل برای لینک ساب (اختیاری)</label><input id="s_u" value="${esc(s.public_url)}" placeholder="https://panel.example.com"><small>خالی = از دامنه‌ی بالا یا آدرس فعلی ساخته می‌شود. پشت nginx/کلودفلر پر کن.</small></div>
  <div class="fg"><label>عنوان اشتراک</label><input id="s_t" value="${esc(s.sub_title)}"></div>
+ <div class="fg"><label>کانال تلگرام (نمایش در صفحهٔ ساب؛ اختیاری)</label><input id="s_tg" dir="ltr" value="${esc(s.sub_telegram||'')}" placeholder="sepiamDigee"></div>
  <div class="fg"><label>بازه آپدیت خودکار در اپ کلاینت (ساعت)</label><input id="s_i" type="number" value="${s.update_interval}"></div>
  <button class="p" onclick="saveSet()">${ic('save')}ذخیره تغییرات</button></div>
 <div class="card"><div class="ch">${ic('info')}اطلاعات سرور</div><div class="meta"><span>WireGuard: <b>${esc(sv.wg||'نصب نیست')}</b></span><span>AmneziaWG: <b>${esc(sv.awg||'نصب نیست')}</b></span><span>اینترفیس خروجی: <b>${esc(sv.nat_iface)}</b></span><span>QR: <b>${sv.qr?'فعال':'نصب نیست'}</b></span><span>HTTPS: <b>${p.tls_on?'فعال':'خاموش'}</b></span></div></div></div>`}
-function saveSet(){act(()=>api('/settings','PUT',{public_url:$('#s_u').value,sub_title:$('#s_t').value,update_interval:$('#s_i').value}),'ذخیره شد')}
+function saveSet(){act(()=>api('/settings','PUT',{public_url:$('#s_u').value,sub_title:$('#s_t').value,sub_telegram:$('#s_tg').value,update_interval:$('#s_i').value}),'ذخیره شد')}
 function savePanel(){act(()=>api('/panel','PUT',{domain:$('#p_dom').value,port:$('#p_port').value,path:$('#p_path').value,cert:$('#p_cert').value,key:$('#p_key').value,allowed_ips:$('#p_allow').value}),'ذخیره شد')}
 async function restartPanel(){if(!confirm('پنل ری‌استارت می‌شود و به آدرس جدید می‌روید. ادامه؟'))return;try{const r=await api('/panel/restart','POST');toast('در حال ری‌استارت…');setTimeout(()=>{location.href=r.url},3500)}catch(e){toast(e.message,1)}}
 function issueCert(){toast('در حال گرفتن گواهی… (تا ۲ دقیقه)');act(()=>api('/panel/cert','POST',{domain:$('#p_dom').value,email:$('#p_mail').value}),'گواهی ساخته شد؛ پنل را ری‌استارت کنید')}
