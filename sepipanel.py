@@ -1365,13 +1365,14 @@ def fmt_b(n):
         n /= 1024
 
 
-SUB_CSS = """body{margin:0;font:15px/1.7 Vazirmatn,Tahoma,sans-serif;background:#eef1f4;color:#14202b}
-.w{max-width:720px;margin:0 auto;padding:20px 14px 60px}h1{font-size:20px;margin:6px 0 2px}
-.m{color:#5b6b7a;font-size:13px}.bar{height:8px;background:#d9dfe5;border-radius:4px;overflow:hidden;margin:8px 0}
-.bar i{display:block;height:100%;background:#9b1c24}.c{background:#fff;border:1px solid #d5dce3;border-radius:8px;padding:14px;margin-top:14px}
-pre{direction:ltr;text-align:left;background:#f4f6f8;border:1px solid #e0e5ea;border-radius:6px;padding:10px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
-img{width:200px;max-width:100%;background:#fff;display:block;margin:8px auto}a.b,button{display:inline-block;background:#9b1c24;color:#fff;border:0;border-radius:6px;padding:7px 14px;font:inherit;text-decoration:none;cursor:pointer;margin:2px 0 2px 6px}
-code{direction:ltr;unicode-bidi:embed;word-break:break-all}.bad{color:#9b1c24;font-weight:700}"""
+SUB_CSS = """:root{color-scheme:dark}body{margin:0;font:15px/1.7 Vazirmatn,IRANSans,Tahoma,sans-serif;background:#0a1120;color:#e8eef9}
+.w{max-width:720px;margin:0 auto;padding:24px 14px 60px}h1{font-size:22px;margin:6px 0 2px}
+.m{color:#8b9cb8;font-size:13px}.bar{height:8px;background:#1b2a47;border-radius:4px;overflow:hidden;margin:10px 0}
+.bar i{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa)}.c{background:#101a2e;border:1px solid #1b2840;border-radius:14px;padding:16px;margin-top:14px}
+pre{direction:ltr;text-align:left;background:#0a1322;border:1px solid #1b2840;color:#cfe0ff;border-radius:10px;padding:12px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+img{box-sizing:border-box;width:220px;max-width:100%;background:#fff;padding:10px;border-radius:12px;display:block;margin:10px auto}a.b,button{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:9px;padding:8px 16px;font:inherit;text-decoration:none;cursor:pointer;margin:2px 0 2px 6px}
+a.b:hover,button:hover{background:#1d4ed8}
+code{direction:ltr;unicode-bidi:embed;word-break:break-all}.bad{color:#f87171;font-weight:700}"""
 
 
 def sub_page(c, items, base):
@@ -1485,55 +1486,96 @@ def index():
 
 # ------------------------------ رابط کاربری ------------------------------
 INDEX_HTML = r"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>SepiPanel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>SepiPanel</title><meta name="color-scheme" content="dark">
 <style>
-:root{--bg:#eef1f4;--card:#fff;--ink:#14202b;--mut:#5b6b7a;--line:#d5dce3;--acc:#9b1c24;--acc2:#7a141b;--ok:#1d7a4d;--warn:#a86a00;--off:#7b8794}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.7 Vazirmatn,Tahoma,"Segoe UI",sans-serif}
+:root{color-scheme:dark;--bg:#0a1120;--side:#0c1424;--card:#101a2e;--card2:#16233d;--field:#15213a;--ink:#e8eef9;--mut:#8b9cb8;--line:#1b2840;--acc:#2563eb;--acc2:#1d4ed8;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--off:#64748b;--pur:#a855f7;--sky:#3b82f6}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14.5px/1.7 Vazirmatn,IRANSans,Tahoma,"Segoe UI",sans-serif}
 button,input,select,textarea{font:inherit;color:inherit}
-a{color:var(--acc)}
-.top{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#14202b;color:#fff}
-.top b{font-size:17px;letter-spacing:.2px}.top button{background:transparent;border:1px solid #4b5b6b;color:#fff}
-.wrap{max-width:980px;margin:0 auto;padding:14px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:14px}
-.st{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
-.st span{display:block;color:var(--mut);font-size:12.5px}.st b{font-size:20px}
-.tabs{display:flex;gap:4px;border-bottom:2px solid var(--line);margin-bottom:14px}
-.tabs button{background:none;border:0;padding:9px 16px;cursor:pointer;color:var(--mut);border-bottom:3px solid transparent;margin-bottom:-2px}
-.tabs button.on{color:var(--acc);border-color:var(--acc);font-weight:700}
-.bar2{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;gap:8px;flex-wrap:wrap}
-button.p,.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:7px 14px;cursor:pointer}
-button.p:hover{background:var(--acc2)}
-button.s{background:#fff;border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer;font-size:13px}
-button.s:hover{border-color:var(--acc);color:var(--acc)}button.s.d{color:var(--acc)}
-.card{background:var(--card);border:1px solid var(--line);border-inline-start:4px solid var(--off);border-radius:8px;padding:12px 14px;margin-bottom:10px}
-.card.up{border-inline-start-color:var(--acc)}
+a{color:#60a5fa}
+::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#243453;border-radius:8px}
+svg.ic{width:1em;height:1em;flex:none;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+/* ---- layout ---- */
+.shell{display:grid;grid-template-columns:250px minmax(0,1fr);min-height:100vh}
+.side{background:var(--side);border-inline-end:1px solid var(--line);position:sticky;top:0;height:100vh;overflow:auto}
+.brand{height:66px;display:flex;align-items:center;gap:12px;padding:0 20px;border-bottom:1px solid var(--line)}
+.brand .lg{width:38px;height:38px;border-radius:11px;background:rgba(37,99,235,.16);color:var(--sky);display:grid;place-items:center;font-size:22px}
+.brand b{font-size:17px;display:block;line-height:1.3}.brand small{display:block;color:var(--mut);font-size:11.5px;line-height:1.3}
+.nav{padding:18px 12px;display:flex;flex-direction:column;gap:6px}
+.nav button{display:flex;align-items:center;gap:12px;background:none;border:0;color:#cbd5e8;padding:11px 14px;border-radius:10px;cursor:pointer;text-align:start;font-size:14.5px;transition:.15s}
+.nav button .ic{font-size:19px}
+.nav button:hover{background:var(--card)}
+.nav button.on{background:var(--acc);color:#fff;box-shadow:0 6px 20px rgba(37,99,235,.35)}
+.main{min-width:0}
+.tb{height:66px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:0 24px;border-bottom:1px solid var(--line);background:var(--side)}
+.usr{display:flex;align-items:center;gap:10px}.usr b{display:block;font-size:14px;line-height:1.3}.usr small{display:flex;align-items:center;gap:5px;color:var(--mut);font-size:11.5px;line-height:1.3}
+.usr small i{width:7px;height:7px;border-radius:50%;background:var(--ok)}
+.av{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#1e3a6e,#2563eb);display:grid;place-items:center;font-size:20px;color:#dbe7ff}
+.sm{font-size:12px}
+.wrap{max-width:1080px;margin:0 auto;padding:30px 24px 50px}
+h1.pt{margin:0 0 2px;font-size:26px;line-height:1.5}p.ps{margin:0 0 24px;color:var(--mut);font-size:13.5px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px;margin-bottom:22px}
+.st{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.st .si{font-size:30px;display:block;line-height:1;margin-bottom:14px}
+.st span.l{display:block;color:var(--mut);font-size:13.5px}.st b{font-size:26px;line-height:1.5}
+.si.g{color:var(--ok)}.si.p{color:var(--pur)}.si.bl{color:var(--sky)}.si.o{color:var(--warn)}
+.bar2{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:8px;flex-wrap:wrap}
+/* ---- buttons ---- */
+button.p,.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;background:var(--acc);color:#fff;border:0;border-radius:9px;padding:9px 18px;cursor:pointer;text-decoration:none;font-size:14px;box-shadow:0 4px 14px rgba(37,99,235,.28);transition:.15s}
+button.p:hover,.btn:hover{background:var(--acc2)}
+button.s{background:var(--card2);border:1px solid var(--line);border-radius:8px;padding:5px 12px;cursor:pointer;font-size:13px;color:#d3def0;transition:.15s}
+button.s:hover{border-color:var(--sky);color:#fff}button.s.d{color:#f87171}button.s.d:hover{border-color:var(--bad)}
+button:disabled{opacity:.5;cursor:not-allowed}
+/* ---- cards ---- */
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:14px}
+.card.up{border-inline-start:3px solid var(--acc)}
+.ch{display:flex;align-items:center;gap:10px;font-weight:700;font-size:15px;margin-bottom:18px}.ch .ic{font-size:18px;color:var(--mut)}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,380px),1fr));gap:16px;align-items:start}.sgrid .card{margin:0}
 .row{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
-.card h3{margin:0;font-size:16px}.card h3 small{color:var(--mut);font-weight:400;margin-inline-start:6px}
-.meta{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:2px 14px;margin:8px 0;color:var(--mut);font-size:13px}
+.card h3{margin:0;font-size:16px}.card h3 small{color:var(--mut);font-weight:400;margin-inline-start:6px;font-size:12.5px}
+.meta{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:3px 14px;margin:10px 0;color:var(--mut);font-size:13px}
 .meta b{color:var(--ink);font-weight:600;direction:ltr;unicode-bidi:embed}
-.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
-.b{font-size:12px;padding:1px 9px;border-radius:10px;color:#fff;background:var(--off)}.b.ok{background:var(--ok)}.b.warn{background:var(--warn)}.b.bad{background:var(--acc)}
-.pg{height:6px;background:#dde3e9;border-radius:3px;overflow:hidden;margin:6px 0}.pg i{display:block;height:100%;background:var(--acc)}
-.tag{display:inline-block;background:#e8edf2;border-radius:4px;padding:0 7px;font-size:12.5px;margin:0 0 3px 4px;direction:ltr}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--off);margin-inline-end:5px}.dot.on{background:var(--ok)}
-.ov{position:fixed;inset:0;background:rgba(10,18,26,.55);display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:20px 10px;z-index:9}
-.md{background:#fff;border-radius:10px;max-width:640px;width:100%;padding:16px 18px}
-.md h2{margin:0 0 10px;font-size:18px}.md h4{margin:16px 0 6px;color:var(--acc);font-size:14px;border-bottom:1px solid var(--line);padding-bottom:3px}
-.fg{margin-bottom:9px}.fg label{display:block;font-size:13px;color:var(--mut)}.fg small{color:var(--mut);font-size:12px}
-.fg input:not([type=checkbox]),.fg select,.fg textarea{width:100%;padding:6px 9px;border:1px solid var(--line);border-radius:6px;background:#fff;direction:ltr;text-align:left}
-.fg textarea{min-height:58px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
-.chk{display:flex!important;align-items:center;gap:7px;color:var(--ink)!important;font-size:14px!important}
-.lk{border:1px solid var(--line);border-radius:6px;padding:8px 10px;margin-bottom:8px}
-.lk details{margin-top:6px}.lk summary{cursor:pointer;color:var(--mut);font-size:13px}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:0 10px}
-pre.cf{direction:ltr;text-align:left;background:#f4f6f8;border:1px solid #e0e5ea;border-radius:6px;padding:10px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
-.mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:14px}
-#toast{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:20;display:flex;flex-direction:column;gap:6px;align-items:center}
-#toast div{background:#14202b;color:#fff;padding:8px 14px;border-radius:6px;max-width:90vw}#toast div.e{background:var(--acc)}
-.login{max-width:340px;margin:12vh auto;background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px}
-.login h1{margin:0 0 12px;font-size:20px}.empty{color:var(--mut);text-align:center;padding:30px 0}
-.mut{color:var(--mut)}img.qr{width:210px;max-width:100%;display:block;margin:8px auto;background:#fff}
-:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.b{font-size:12px;padding:1px 11px;border-radius:12px;color:#cbd5e1;background:rgba(100,116,139,.22);border:1px solid rgba(100,116,139,.35)}
+.b.ok{color:#4ade80;background:rgba(34,197,94,.13);border-color:rgba(34,197,94,.35)}
+.b.warn{color:#fbbf24;background:rgba(245,158,11,.13);border-color:rgba(245,158,11,.35)}
+.b.bad{color:#f87171;background:rgba(239,68,68,.13);border-color:rgba(239,68,68,.35)}
+.pg{height:6px;background:#1b2a47;border-radius:3px;overflow:hidden;margin:8px 0}.pg i{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#60a5fa);border-radius:3px}
+.tag{display:inline-block;background:var(--card2);border:1px solid var(--line);border-radius:6px;padding:0 8px;font-size:12.5px;margin:0 0 3px 4px;direction:ltr;color:#c3d1ea}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--off);margin-inline-end:7px}.dot.on{background:var(--ok);box-shadow:0 0 0 3px rgba(34,197,94,.18)}
+/* ---- forms ---- */
+.fg{margin-bottom:12px}.fg label{display:block;font-size:13px;color:var(--mut);margin-bottom:4px}.fg small{display:block;color:var(--mut);font-size:12px;margin-top:3px;opacity:.85}
+.fg input:not([type=checkbox]),.fg select,.fg textarea{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:9px;background:var(--field);color:var(--ink);direction:ltr;text-align:left;outline:0;transition:.15s}
+.fg input:focus,.fg select:focus,.fg textarea:focus{border-color:var(--sky);box-shadow:0 0 0 3px rgba(59,130,246,.18)}
+.fg input::placeholder,.fg textarea::placeholder{color:#55688a}
+.fg select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'><path d='M1 1l5 5 5-5' fill='none' stroke='%238b9cb8' stroke-width='1.6' stroke-linecap='round'/></svg>");background-repeat:no-repeat;background-position:left 12px center;padding-left:32px}
+.fg select option{background:#101a2e}
+.fg textarea{min-height:62px;font-family:ui-monospace,Consolas,monospace;font-size:13px}
+input[type=date]{color-scheme:dark}
+input[type=checkbox]{appearance:none;-webkit-appearance:none;flex:none;width:42px;height:24px;border-radius:12px;background:#33415a;position:relative;cursor:pointer;transition:.2s;margin:0}
+input[type=checkbox]::after{content:"";position:absolute;top:3px;inset-inline-start:21px;width:18px;height:18px;border-radius:50%;background:#e2e8f0;transition:.2s}
+input[type=checkbox]:checked{background:var(--acc)}input[type=checkbox]:checked::after{inset-inline-start:3px;background:#fff}
+.chk{display:flex!important;flex-direction:row-reverse;justify-content:space-between;align-items:center;gap:12px;color:var(--ink)!important;font-size:14px!important;margin-bottom:0!important;cursor:pointer}
+.lk{border:1px solid var(--line);background:#0d172a;border-radius:11px;padding:10px 12px;margin-bottom:10px}
+.lk details{margin-top:8px}.lk summary{cursor:pointer;color:var(--mut);font-size:13px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:0 12px;margin-top:8px}
+pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--line);color:#cfe0ff;border-radius:10px;padding:12px;overflow:auto;font:12.5px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+/* ---- modal / toast / login ---- */
+.ov{position:fixed;inset:0;background:rgba(3,8,18,.72);backdrop-filter:blur(4px);display:flex;align-items:flex-start;justify-content:center;overflow:auto;padding:24px 10px;z-index:9}
+.md{background:var(--card);border:1px solid var(--line);border-radius:16px;max-width:660px;width:100%;padding:20px 22px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
+.md h2{margin:0 0 14px;font-size:18px}.md h4{margin:18px 0 8px;color:#60a5fa;font-size:14px;border-bottom:1px solid var(--line);padding-bottom:5px}
+.mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+#toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:20;display:flex;flex-direction:column;gap:6px;align-items:center}
+#toast div{background:#1a2742;border:1px solid #2a3b5e;color:#fff;padding:9px 16px;border-radius:10px;max-width:90vw;box-shadow:0 8px 24px rgba(0,0,0,.4)}#toast div.e{background:#3a1519;border-color:#7f1d1d}
+.login{max-width:360px;margin:12vh auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:26px;box-shadow:0 24px 60px rgba(0,0,0,.4)}
+.login .lg2{width:52px;height:52px;border-radius:14px;background:rgba(37,99,235,.16);color:var(--sky);display:grid;place-items:center;font-size:28px;margin:0 auto 12px}
+.login h1{margin:0 0 18px;font-size:20px;text-align:center}.login button.p{width:100%}
+.empty{color:var(--mut);text-align:center;padding:36px 0;background:var(--card);border:1px dashed var(--line);border-radius:14px}
+.mut{color:var(--mut)}img.qr{width:210px;max-width:100%;display:block;margin:10px auto;background:#fff;padding:10px;border-radius:12px}
+:focus-visible{outline:2px solid var(--sky);outline-offset:2px}
+@media(max-width:860px){
+ .shell{grid-template-columns:1fr}.side{position:static;height:auto;border-inline-end:0;border-bottom:1px solid var(--line)}
+ .brand{height:56px}.nav{flex-direction:row;overflow-x:auto;padding:8px 10px}.nav button{white-space:nowrap;padding:9px 13px}
+ .tb{height:56px;padding:0 14px}.wrap{padding:20px 14px 40px}h1.pt{font-size:22px}}
 @media(max-width:520px){.g2{grid-template-columns:1fr}}
 </style></head><body><div id="app"></div><div id="toast"></div>
 <script>
@@ -1550,22 +1592,42 @@ async function api(p,m='GET',b){const r=await fetch(BASE+'/api'+p,{method:m,head
  const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.statusText);return d}
 async function act(fn,msg){try{const r=await fn();if(r&&r.warn)toast(r.warn,1);else if(msg)toast(msg);await load();return true}catch(e){toast(e.message,1);return false}}
 function copy(t){if(navigator.clipboard&&isSecureContext)navigator.clipboard.writeText(t);else{const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}toast('کپی شد')}
-function showLogin(){$('#app').innerHTML=`<div class="login"><h1>ورود به SepiPanel</h1><div class="fg"><label>نام کاربری</label><input id="lu" autocomplete="username"></div>
-<div class="fg"><label>رمز عبور</label><input id="lp" type="password" autocomplete="current-password"></div><button class="p" style="width:100%" onclick="doLogin()">ورود</button></div>`;
+const IC={
+ users:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
+ layers:'<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
+ settings:'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+ logout:'<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
+ server:'<rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><path d="M6 6h.01M6 18h.01"/>',
+ pulse:'<path d="M22 12h-4l-3 9L9 3l-3 9H2"/>',
+ db:'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/>',
+ shield:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+ globe:'<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20 15 15 0 0 1 0-20z"/>',
+ link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
+ info:'<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
+ save:'<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
+ user:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>'};
+const ic=n=>`<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${IC[n]||''}</svg>`;
+function showLogin(){$('#app').innerHTML=`<div class="login"><div class="lg2">${ic('shield')}</div><h1>ورود به SepiPanel</h1><div class="fg"><label>نام کاربری</label><input id="lu" autocomplete="username"></div>
+<div class="fg"><label>رمز عبور</label><input id="lp" type="password" autocomplete="current-password"></div><button class="p" onclick="doLogin()">ورود</button></div>`;
  $('#lp').onkeydown=e=>{if(e.key==='Enter')doLogin()}}
 async function doLogin(){try{await api('/login','POST',{u:$('#lu').value,p:$('#lp').value});load()}catch(e){toast(e.message,1)}}
 async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1)}}
 const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad']};
+const NAV=[['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
 function render(){
- const on=S.clients.filter(c=>c.online).length,tot=S.clients.reduce((a,c)=>a+c.up_bytes+c.down_bytes,0);
- $('#app').innerHTML=`<div class="top"><b>SepiPanel</b><span class="mut" style="color:#9fb0c0;font-size:12px">${esc(S.server.wg||'wireguard-tools یافت نشد!')}</span><button class="s" onclick="logout()">خروج</button></div>
- <div class="wrap"><div class="stats"><div class="st"><span>اینباند فعال</span><b>${S.inbounds.filter(i=>i.up).length} / ${S.inbounds.length}</b></div>
- <div class="st"><span>کلاینت‌ها</span><b>${S.clients.length}</b></div><div class="st"><span>آنلاین</span><b>${on}</b></div><div class="st"><span>مصرف کل</span><b>${fmtB(tot)}</b></div></div>
- <div class="tabs">${[['cli','کلاینت‌ها'],['inb','اینباندها'],['set','تنظیمات']].map(([k,l])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${l}</button>`).join('')}</div>
- ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():setHTML()}</div>`}
+ const on=S.clients.filter(c=>c.online).length,tot=S.clients.reduce((a,c)=>a+c.up_bytes+c.down_bytes,0),cur=NAV.find(n=>n[0]==TAB);
+ $('#app').innerHTML=`<div class="shell"><aside class="side"><div class="brand"><span class="lg">${ic('shield')}</span><div><b>SepiPanel</b><small>مدیریت WireGuard</small></div></div>
+ <nav class="nav">${NAV.map(([k,l,i])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${ic(i)}<span>${l}</span></button>`).join('')}<button onclick="logout()">${ic('logout')}<span>خروج</span></button></nav></aside>
+ <div class="main"><header class="tb"><span class="mut sm">${esc(S.server.wg||'wireguard-tools یافت نشد!')}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
+ <div class="wrap"><h1 class="pt">${cur[1]}</h1><p class="ps">${cur[3]}</p>
+ <div class="stats"><div class="st"><span class="si g">${ic('server')}</span><span class="l">اینباند فعال</span><b>${S.inbounds.filter(i=>i.up).length} / ${S.inbounds.length}</b></div>
+ <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
+ <div class="st"><span class="si bl">${ic('pulse')}</span><span class="l">آنلاین</span><b>${on}</b></div>
+ <div class="st"><span class="si o">${ic('db')}</span><span class="l">مصرف کل</span><b>${fmtB(tot)}</b></div></div>
+ ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():setHTML()}</div></div></div>`}
 async function logout(){await api('/logout','POST');showLogin()}
 /* ---------- اینباندها ---------- */
-function inbHTML(){return `<div class="bar2"><span class="mut">هر اینباند یک اینترفیس وایرگارد است</span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
+function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
  (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
  <span class="b ${i.enabled?(i.up?'ok':'warn'):''}">${i.enabled?(i.up?'بالا':'پایین (خطا؟)'):'غیرفعال'}</span></div>
  <div class="meta"><span>پورت: <b>${i.port}/udp</b></span><span>IPv4: <b>${esc(i.address4)}</b></span>${i.address6?`<span>IPv6: <b>${esc(i.address6)}</b></span>`:''}
@@ -1621,7 +1683,7 @@ function fieldHTML(f,v,edit){
 function collect(fields,edit){const o={};for(const f of fields){if(f.s||f.t==='btn'||(f.edit&&!edit))continue;const e=$('#f_'+f.k);const v=f.t==='check'?e.checked:e.value;if(f.k.startsWith('o_')){(o.obf=o.obf||{})[f.k.slice(2)]=v}else o[f.k]=v}return o}
 function modal(html){const m=document.createElement('div');m.className='ov';m.innerHTML=`<div class="md">${html}</div>`;m.addEventListener('mousedown',e=>{if(e.target===m)m.remove()});document.body.appendChild(m);return m}
 function formModal(title,fields,vals,edit,onSave){
- const m=modal(`<h2>${title}</h2>${fields.map(f=>fieldHTML(f,vals,edit)).join('')}<div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">ذخیره</button></div>`);
+ const m=modal(`<h2>${title}</h2>${fields.map(f=>fieldHTML(f,vals,edit)).join('')}<div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">${ic('save')}ذخیره</button></div>`);
  m.querySelector('#mc').onclick=()=>m.remove();
  m.querySelector('#ms').onclick=async()=>{if(await onSave(collect(fields,edit)))m.remove()}}
 function newInb(){const d=S.defaults;formModal('اینباند جدید',INB,{...d,obf_ver:'3'},false,o=>act(()=>api('/inbounds','POST',o),'اینباند ساخته شد'))}
@@ -1629,7 +1691,7 @@ function editInb(id){const i=S.inbounds.find(x=>x.id==id);formModal('ویرای�
 function delInb(id,n){if(confirm(`اینباند ${n} و اتصال همه کلاینت‌هایش حذف شود؟`))act(()=>api('/inbounds/'+id,'DELETE'),'حذف شد')}
 async function showConf(id){try{const r=await api('/inbounds/'+id+'/conf');const m=modal(`<h2>کانفیگ سرور</h2><pre class="cf">${esc(r.conf)}</pre><div class="mfoot"><button class="s" id="x">بستن</button></div>`);m.querySelector('#x').onclick=()=>m.remove()}catch(e){toast(e.message,1)}}
 /* ---------- کلاینت‌ها ---------- */
-function cliHTML(){return `<div class="bar2"><span class="mut">هر کلاینت می‌تواند عضو چند اینباند باشد</span><button class="p" onclick="newCli()">+ کلاینت جدید</button></div>`+
+function cliHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newCli()">+ کلاینت جدید</button></div>`+
  (S.clients.map(c=>{const u=c.up_bytes+c.down_bytes,pct=c.limit_bytes?Math.min(100,u*100/c.limit_bytes):0,st=STL[c.state]||[c.state,''];
  return `<article class="card ${c.state=='active'?'up':''}"><div class="row"><h3><span class="dot ${c.online?'on':''}"></span>${esc(c.name)}<small>${esc(c.note)}</small></h3><span class="b ${st[1]}">${st[0]}</span></div>
  <div class="pg"><i style="width:${c.limit_bytes?pct:0}%"></i></div>
@@ -1653,7 +1715,7 @@ function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_b
  <div class="fg"><label>تاریخ انقضا</label><input type="date" id="f_exp" value="${c&&c.expiry?new Date(c.expiry*1000).toISOString().slice(0,10):''}">
  <div style="margin-top:4px"><button class="s" type="button" data-d="30">+۳۰ روز</button> <button class="s" type="button" data-d="90">+۹۰ روز</button> <button class="s" type="button" data-d="0">نامحدود</button></div></div>
  <h4>اینباندها</h4>${S.inbounds.length?S.inbounds.map(ib=>{const L=c&&c.links.find(l=>l.inbound_id==ib.id);return linkBlock(ib,L?{...L,keepalive:L.keepalive<0?'':L.keepalive,mtu:L.mtu||''}:(!c&&ib.enabled?{}:null))}).join(''):'<div class="mut">اول یک اینباند بسازید.</div>'}
- <div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">ذخیره</button></div>`);
+ <div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">${ic('save')}ذخیره</button></div>`);
  m.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{const d=+b.dataset.d;const e=m.querySelector('#f_exp');if(!d){e.value='';return}const base=c&&c.expiry*1000>Date.now()?c.expiry*1000:Date.now();e.value=new Date(base+d*864e5).toISOString().slice(0,10)});
  m.querySelector('#mc').onclick=()=>m.remove();
  m.querySelector('#ms').onclick=async()=>{const o=collect(fields,!!c);const ev=m.querySelector('#f_exp').value;o.expiry=ev?Math.floor(new Date(ev+'T23:59:59').getTime()/1000):0;
@@ -1675,31 +1737,31 @@ function subModal(id){const c=S.clients.find(x=>x.id==id);const u=c.sub_url;
  m.querySelector('#b3').onclick=async()=>{if(confirm('کلیدهای کلاینت عوض می‌شود و کانفیگ‌های قبلی کار نمی‌کنند. ادامه؟')&&await act(()=>api('/clients/'+id+'/regen-keys','POST'),'کلیدها عوض شد'))m.remove()}}
 /* ---------- تنظیمات ---------- */
 function setHTML(){const s=S.settings,p=S.panel,sv=S.server;return `
-${p.default_pass?`<div class="card" style="border-inline-start-color:var(--acc)"><b>هشدار امنیتی:</b> رمز پیش‌فرض داخل فایل هنوز فعال است. همین حالا از «حساب مدیر» عوضش کن.</div>`:''}
-${p.restart_needed?`<div class="card" style="border-inline-start-color:var(--warn)">تغییر پورت/HTTPS ذخیره شده ولی هنوز اعمال نشده. <button class="p" onclick="restartPanel()">ری‌استارت پنل</button></div>`:''}
-<div class="card" style="max-width:640px"><h3>دامنه، پورت و HTTPS پنل</h3><br>
+${p.default_pass?`<div class="card" style="border-inline-start:4px solid var(--bad)"><b>هشدار امنیتی:</b> رمز پیش‌فرض داخل فایل هنوز فعال است. همین حالا از «حساب مدیر» عوضش کن.</div>`:''}
+${p.restart_needed?`<div class="card" style="border-inline-start:4px solid var(--warn)">تغییر پورت/HTTPS ذخیره شده ولی هنوز اعمال نشده. <button class="p" onclick="restartPanel()">ری‌استارت پنل</button></div>`:''}
+<div class="sgrid"><div class="card"><div class="ch">${ic('globe')}دامنه، پورت و HTTPS پنل</div>
  <div class="fg"><label>دامنه پنل</label><input id="p_dom" value="${esc(p.domain)}" placeholder="panel.example.com"><small>رکورد A دامنه باید به IP همین سرور اشاره کند. لینک‌های ساب با این دامنه ساخته می‌شوند.</small></div>
  <div class="g2"><div class="fg"><label>پورت پنل</label><input id="p_port" type="number" value="${p.port}"></div>
  <div class="fg"><label>مسیر مخفی (اختیاری)</label><input id="p_path" value="${esc(p.path)}" placeholder="مثلا x7k2q9"></div></div>
  <div class="fg"><label>مسیر فایل گواهی (fullchain.pem)</label><input id="p_cert" value="${esc(p.cert)}" placeholder="/etc/letsencrypt/live/panel.example.com/fullchain.pem"></div>
  <div class="fg"><label>مسیر کلید خصوصی (privkey.pem)</label><input id="p_key" value="${esc(p.key)}"></div>
  <div class="fg"><label>فقط این IPها به پنل دسترسی داشته باشند (اختیاری)</label><input id="p_allow" value="${esc(p.allowed_ips)}" placeholder="1.2.3.4, 10.0.0.0/8"><small>لینک‌های ساب مشمول این محدودیت نیستند. پشت پروکسی معکوس از این گزینه استفاده نکن. اگر قفل شدی: python3 sepipanel.py --reset</small></div>
- <div class="acts"><button class="p" onclick="savePanel()">ذخیره</button><button class="s" onclick="restartPanel()">ری‌استارت پنل</button></div>
+ <div class="acts"><button class="p" onclick="savePanel()">${ic('save')}ذخیره تغییرات</button><button class="s" onclick="restartPanel()">ری‌استارت پنل</button></div>
  <h4>گواهی رایگان Let's Encrypt</h4>
  <div class="fg"><label>ایمیل</label><input id="p_mail" placeholder="you@example.com"></div>
  <button class="s" onclick="issueCert()" ${p.certbot?'':'disabled'}>دریافت گواهی با certbot</button>
  <div><small class="mut">${p.certbot?'پورت 80 باید آزاد باشد. بعد از دریافت، پنل را ری‌استارت کن.':'certbot نصب نیست: apt install certbot'}</small></div></div>
-<div class="card" style="max-width:640px"><h3>حساب مدیر</h3><br>
+<div class="card"><div class="ch">${ic('shield')}حساب مدیر</div>
  <div class="fg"><label>رمز فعلی</label><input id="a_cur" type="password" autocomplete="current-password"></div>
  <div class="fg"><label>نام کاربری</label><input id="a_user" value="${esc(p.user)}"></div>
  <div class="fg"><label>رمز جدید (حداقل ۱۰ کاراکتر؛ خالی = بدون تغییر)</label><input id="a_new" type="password" autocomplete="new-password"></div>
- <button class="p" onclick="saveAcct()">ذخیره</button> <small class="mut">بعد از تغییر، نشست‌های دیگر بسته می‌شوند.</small></div>
-<div class="card" style="max-width:640px"><h3>تنظیمات اشتراک</h3><br>
+ <button class="p" onclick="saveAcct()">${ic('save')}ذخیره تغییرات</button> <small class="mut">بعد از تغییر، نشست‌های دیگر بسته می‌شوند.</small></div>
+<div class="card"><div class="ch">${ic('link')}تنظیمات اشتراک</div>
  <div class="fg"><label>آدرس عمومی پنل برای لینک ساب (اختیاری)</label><input id="s_u" value="${esc(s.public_url)}" placeholder="https://panel.example.com"><small>خالی = از دامنه‌ی بالا یا آدرس فعلی ساخته می‌شود. پشت nginx/کلودفلر پر کن.</small></div>
  <div class="fg"><label>عنوان اشتراک</label><input id="s_t" value="${esc(s.sub_title)}"></div>
  <div class="fg"><label>بازه آپدیت خودکار در اپ کلاینت (ساعت)</label><input id="s_i" type="number" value="${s.update_interval}"></div>
- <button class="p" onclick="saveSet()">ذخیره</button></div>
-<div class="card" style="max-width:640px"><h3>اطلاعات سرور</h3><div class="meta"><span>WireGuard: <b>${esc(sv.wg||'نصب نیست')}</b></span><span>AmneziaWG: <b>${esc(sv.awg||'نصب نیست')}</b></span><span>اینترفیس خروجی: <b>${esc(sv.nat_iface)}</b></span><span>QR: <b>${sv.qr?'فعال':'نصب نیست'}</b></span><span>HTTPS: <b>${p.tls_on?'فعال':'خاموش'}</b></span></div></div>`}
+ <button class="p" onclick="saveSet()">${ic('save')}ذخیره تغییرات</button></div>
+<div class="card"><div class="ch">${ic('info')}اطلاعات سرور</div><div class="meta"><span>WireGuard: <b>${esc(sv.wg||'نصب نیست')}</b></span><span>AmneziaWG: <b>${esc(sv.awg||'نصب نیست')}</b></span><span>اینترفیس خروجی: <b>${esc(sv.nat_iface)}</b></span><span>QR: <b>${sv.qr?'فعال':'نصب نیست'}</b></span><span>HTTPS: <b>${p.tls_on?'فعال':'خاموش'}</b></span></div></div></div>`}
 function saveSet(){act(()=>api('/settings','PUT',{public_url:$('#s_u').value,sub_title:$('#s_t').value,update_interval:$('#s_i').value}),'ذخیره شد')}
 function savePanel(){act(()=>api('/panel','PUT',{domain:$('#p_dom').value,port:$('#p_port').value,path:$('#p_path').value,cert:$('#p_cert').value,key:$('#p_key').value,allowed_ips:$('#p_allow').value}),'ذخیره شد')}
 async function restartPanel(){if(!confirm('پنل ری‌استارت می‌شود و به آدرس جدید می‌روید. ادامه؟'))return;try{const r=await api('/panel/restart','POST');toast('در حال ری‌استارت…');setTimeout(()=>{location.href=r.url},3500)}catch(e){toast(e.message,1)}}
