@@ -2076,6 +2076,21 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
 .login h1{margin:0 0 18px;font-size:20px;text-align:center}.login button.p{width:100%}
 .empty{color:var(--mut);text-align:center;padding:36px 0;background:var(--card);border:1px dashed var(--line);border-radius:14px}
 .mut{color:var(--mut)}img.qr{width:210px;max-width:100%;display:block;margin:10px auto;background:#fff;padding:10px;border-radius:12px}
+.tl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1;min-width:0}
+.srch{flex:1;min-width:150px;max-width:340px;direction:rtl;text-align:right}
+.cl{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.cr2{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr) minmax(0,1fr) auto;gap:6px 16px;align-items:center;padding:9px 14px;border-bottom:1px solid var(--line);border-inline-start:3px solid transparent;transition:background .15s}
+.cr2:last-child{border-bottom:0}.cr2:hover{background:rgba(59,130,246,.05)}.cr2.on{border-inline-start-color:var(--acc)}
+.cr2 .c1 b{display:flex;align-items:center;font-size:14px;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cr2 small{display:block;color:var(--mut);font-size:12px;line-height:1.5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cr2 .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.own{flex:none;margin-inline-start:8px;font-size:11.5px;font-weight:400;padding:0 9px;border-radius:12px;color:#d8b4fe;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.4)}
+.cr2 .tg{margin-top:2px;line-height:1.3}.cr2 .tag{font-size:11.5px;padding:0 6px;margin:0 0 2px 3px}
+.cr2 .c2 .pg{margin:0 0 3px}.cr2 .c3{display:flex;flex-direction:column;align-items:flex-start;gap:2px}
+.cr2 .acts{margin:0;gap:5px;flex-wrap:nowrap}.cr2 .acts .s{padding:3px 9px;font-size:12px;white-space:nowrap}
+.pgr{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
+.pgb{display:flex;gap:5px;flex-wrap:wrap;align-items:center}.pgb .s{min-width:32px;padding:4px 10px}.pgb .s.cur{background:var(--acc);border-color:var(--acc);color:#fff}
+@media(max-width:1000px){.cr2{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.cr2 .c4{grid-column:1/-1}.cr2 .acts{flex-wrap:wrap}}
 .fsel{background:var(--field);border:1px solid var(--line);border-radius:9px;padding:8px 12px;color:var(--ink);outline:0;max-width:60vw}
 :focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 @media(max-width:860px){
@@ -2208,18 +2223,32 @@ function meCard(){const m=S.me;if(!m)return '';const u=m.used_bytes,pct=m.limit_
  <div class="meta"><span>حجم مصرفی: <b>${fmtB(u)}</b> / <b>${m.limit_bytes?fmtB(m.limit_bytes):'نامحدود'}</b></span><span>باقی‌مانده: <b>${m.limit_bytes?fmtB(Math.max(0,m.limit_bytes-u)):'نامحدود'}</b></span>
  <span>انقضا: <b style="direction:rtl">${fmtD(m.expiry)}${dleft(m.expiry)}</b></span></div>
  ${m.state!='active'?'<div style="color:#f87171">حجم یا اعتبار حساب شما تمام شده؛ کلاینت‌های شما تا تمدید توسط مدیر غیرفعال‌اند.</div>':''}</div>`}
-function cliHTML(){const flt=S.clients.filter(c=>isA()||CF==='all'||(CF==='0'?!c.owner_id:String(c.owner_id)===CF));
- return (isA()?meCard():'')+`<div class="bar2">${isA()||!S.admins.length?'<span></span>':`<select class="fsel" onchange="CF=this.value;render()"><option value="all">همه کلاینت‌ها</option><option value="0" ${CF==='0'?'selected':''}>مدیر اصلی</option>${S.admins.map(a=>`<option value="${a.id}" ${CF==String(a.id)?'selected':''}>ادمین: ${esc(a.username)}</option>`).join('')}</select>`}<button class="p" onclick="newCli()">+ کلاینت جدید</button></div>`+
- (flt.map(c=>{const u=c.up_bytes+c.down_bytes,pct=c.limit_bytes?Math.min(100,u*100/c.limit_bytes):0,st=STL[c.state]||[c.state,''];
- return `<article class="card ${c.state=='active'?'up':''}"><div class="row"><h3><span class="dot ${c.online?'on':''}"></span>${esc(c.name)}<small>${esc(c.note)}</small></h3><span class="b ${st[1]}">${st[0]}</span></div>
- <div class="pg"><i style="width:${c.limit_bytes?pct:0}%"></i></div>
- <div class="meta"><span>مصرف: <b>${fmtB(u)}</b> / <b>${c.limit_bytes?fmtB(c.limit_bytes):'نامحدود'}</b></span><span>↑ ${fmtB(c.up_bytes)} &nbsp; ↓ ${fmtB(c.down_bytes)}</span>
- <span>انقضا: <b style="direction:rtl">${fmtD(c.expiry)}</b></span><span>آخرین اتصال: <b style="direction:rtl">${ago(c.last_seen)}</b></span></div>
- <div>${!isA()&&c.owner_id?`<span class="tag" style="color:#c4b5fd">ادمین: ${esc(admName(c.owner_id))}</span>`:''}${c.links.map(l=>`<span class="tag">${esc(l.ib_name)} · ${esc(l.ip4)}</span>`).join('')||'<span class="mut">بدون اینباند</span>'}</div>
- <div class="acts"><button class="s" onclick="subModal(${c.id})">لینک ساب / QR</button><button class="s" onclick="editCli(${c.id})">ویرایش</button>
- <button class="s" onclick="act(()=>api('/clients/${c.id}/toggle','POST'))">${c.enabled?'غیرفعال‌سازی':'فعال‌سازی'}</button>
- <button class="s" onclick="act(()=>api('/clients/${c.id}/reset-traffic','POST'),'ترافیک ریست شد')">ریست ترافیک</button>
- <button class="s d" onclick="delCli(${c.id},'${esc(c.name)}')">حذف</button></div></article>`}).join('')||'<div class="empty">کلاینتی وجود ندارد.</div>')}
+let CQ='',CP=1,CPS=20;
+const rndName=()=>{const a='abcdefghjkmnpqrstuvwxyz23456789';return [...crypto.getRandomValues(new Uint8Array(8))].map(b=>a[b%a.length]).join('')};
+function cliFiltered(){const k=CQ.trim().toLowerCase();return S.clients.filter(c=>(isA()||CF==='all'||(CF==='0'?!c.owner_id:String(c.owner_id)===CF))&&(!k||(c.name+' '+(c.note||'')+' '+(c.owner_id&&!isA()?admName(c.owner_id):'')+' '+c.links.map(l=>l.ip4).join(' ')).toLowerCase().includes(k)))}
+function cliRow(c){const u=c.up_bytes+c.down_bytes,pct=c.limit_bytes?Math.min(100,u*100/c.limit_bytes):0,st=STL[c.state]||[c.state,''];
+ const own=!isA()&&c.owner_id?`<span class="own" title="این کلاینت را ادمین ${esc(admName(c.owner_id))} ساخته است">ساخته‌شده توسط: ${esc(admName(c.owner_id))}</span>`:'';
+ const tags=c.links.map(l=>`<span class="tag" title="${esc(l.ip4)}">${esc(l.ib_name)}</span>`).join('')||'<span class="mut sm">بدون اینباند</span>';
+ return `<div class="cr2 ${c.state=='active'?'on':''}"><div class="c1"><b><span class="dot ${c.online?'on':''}" title="آخرین اتصال: ${ago(c.last_seen)}"></span><span class="nm">${esc(c.name)}</span>${own}</b>${c.note?`<small>${esc(c.note)}</small>`:''}<div class="tg">${tags}</div></div>
+ <div class="c2"><div class="pg"><i style="width:${pct}%"></i></div><small>${fmtB(u)} / ${c.limit_bytes?fmtB(c.limit_bytes):'نامحدود'}</small></div>
+ <div class="c3"><span class="b ${st[1]}">${st[0]}</span><small style="direction:rtl">${c.expiry?fmtD(c.expiry)+dleft(c.expiry):'بدون انقضا'}</small></div>
+ <div class="c4 acts"><button class="s" onclick="subModal(${c.id})">ساب / QR</button><button class="s" onclick="editCli(${c.id})">ویرایش</button>
+ <button class="s" onclick="act(()=>api('/clients/${c.id}/toggle','POST'))">${c.enabled?'غیرفعال':'فعال'}</button>
+ <button class="s" onclick="act(()=>api('/clients/${c.id}/reset-traffic','POST'),'ترافیک ریست شد')">ریست</button>
+ <button class="s d" onclick="delCli(${c.id},'${esc(c.name)}')">حذف</button></div></div>`}
+function pager(total){const pages=Math.max(1,Math.ceil(total/CPS)),nums=[];
+ for(let i=1;i<=pages;i++){if(i==1||i==pages||Math.abs(i-CP)<=1)nums.push(i);else if(nums[nums.length-1]!=='…')nums.push('…')}
+ const nav=pages>1?`<button class="s" ${CP<=1?'disabled':''} onclick="goP(${CP-1})">قبلی</button>`+nums.map(n=>n==='…'?'<span class="mut">…</span>':`<button class="s ${n==CP?'cur':''}" onclick="goP(${n})">${n}</button>`).join('')+`<button class="s" ${CP>=pages?'disabled':''} onclick="goP(${CP+1})">بعدی</button>`:'';
+ return `<div class="pgr"><span class="mut sm">${(CP-1)*CPS+1}–${Math.min(total,CP*CPS)} از ${total} کلاینت</span><div class="pgb">${nav}</div>
+ <label class="mut sm">تعداد در هر صفحه <select class="fsel" onchange="CPS=+this.value;CP=1;$('#clist').innerHTML=cliList()">${[10,20,50,100].map(n=>`<option ${n==CPS?'selected':''}>${n}</option>`).join('')}</select></label></div>`}
+function cliList(){const f=cliFiltered(),pages=Math.max(1,Math.ceil(f.length/CPS));if(CP>pages)CP=pages;
+ if(!f.length)return `<div class="empty">${S.clients.length?'کلاینتی با این مشخصات پیدا نشد.':'کلاینتی وجود ندارد.'}</div>`;
+ return `<div class="cl">${f.slice((CP-1)*CPS,CP*CPS).map(cliRow).join('')}</div>`+pager(f.length)}
+function setQ(v){CQ=v;CP=1;$('#clist').innerHTML=cliList()}
+function goP(n){CP=n;$('#clist').innerHTML=cliList();$('#ctool').scrollIntoView({behavior:'smooth',block:'start'})}
+function cliHTML(){return (isA()?meCard():'')+`<div class="bar2" id="ctool"><div class="tl"><input id="cq" class="fsel srch" type="search" dir="auto" placeholder="جستجوی نام کلاینت…" value="${esc(CQ)}" oninput="setQ(this.value)" autocomplete="off">
+ ${isA()||!S.admins.length?'':`<select class="fsel" onchange="CF=this.value;CP=1;render()"><option value="all">همه کلاینت‌ها</option><option value="0" ${CF==='0'?'selected':''}>مدیر اصلی</option>${S.admins.map(a=>`<option value="${a.id}" ${CF==String(a.id)?'selected':''}>ادمین: ${esc(a.username)}</option>`).join('')}</select>`}</div>
+ <button class="p" onclick="newCli()">+ کلاینت جدید</button></div><div id="clist">${cliList()}</div>`}
 const CLI=[{k:'name',l:'نام کلاینت',rtl:1},{k:'count',l:'تعداد (ساخت گروهی؛ نام‌ها شماره‌دار می‌شوند)',t:'number',create:1},
  {k:'note',l:'یادداشت',rtl:1},{k:'limit_gb',l:'محدودیت حجم (گیگابایت)',t:'number',h:'۰ = نامحدود'},
  {k:'reset_period',l:'ریست خودکار ترافیک',t:'select',opts:[['','هرگز'],['daily','روزانه'],['weekly','هفتگی'],['monthly','ماهانه (هر ۳۰ روز)']]}];
@@ -2236,6 +2265,8 @@ function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_b
  <div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">${ic('save')}ذخیره</button></div>`);
  m.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{const d=+b.dataset.d;const e=m.querySelector('#f_exp');if(!d){e.value='';return}const base=c&&c.expiry*1000>Date.now()?c.expiry*1000:Date.now();e.value=new Date(base+d*864e5).toISOString().slice(0,10)});
  m.querySelector('#mc').onclick=()=>m.remove();
+ {const ni=m.querySelector('#f_name');if(ni){const w=document.createElement('div');w.style.cssText='display:flex;gap:8px;align-items:center';ni.parentNode.insertBefore(w,ni);w.appendChild(ni);ni.style.flex='1';ni.style.minWidth='0';
+  const rb=document.createElement('button');rb.type='button';rb.className='s';rb.style.whiteSpace='nowrap';rb.textContent='🎲 رندوم';rb.onclick=()=>{ni.value=rndName()};w.appendChild(rb)}}
  m.querySelector('#ms').onclick=async()=>{const o=collect(fields,!!c);const ev=m.querySelector('#f_exp').value;o.expiry=ev?Math.floor(new Date(ev+'T23:59:59').getTime()/1000):0;
   o.links=[...m.querySelectorAll('.lk')].filter(b=>b.querySelector('.lkc').checked).map(b=>{const g=k=>b.querySelector('.l_'+k).value.trim();return{inbound_id:+b.dataset.ib,ip4:g('ip4'),allowed_ips:g('allowed_ips'),keepalive:g('keepalive'),dns:g('dns'),mtu:g('mtu'),extra_allowed:g('extra_allowed')}});
   if(await act(()=>api(c?'/clients/'+c.id:'/clients',c?'PUT':'POST',o),'ذخیره شد'))m.remove()}}
@@ -2321,7 +2352,7 @@ function savePanel(){act(()=>api('/panel','PUT',{domain:$('#p_dom').value,port:$
 async function restartPanel(){if(!confirm('پنل ری‌استارت می‌شود و به آدرس جدید می‌روید. ادامه؟'))return;try{const r=await api('/panel/restart','POST');toast('در حال ری‌استارت…');setTimeout(()=>{location.href=r.url},3500)}catch(e){toast(e.message,1)}}
 function issueCert(){toast('در حال گرفتن گواهی… (تا ۲ دقیقه)');act(()=>api('/panel/cert','POST',{domain:$('#p_dom').value,email:$('#p_mail').value}),'گواهی ساخته شد؛ پنل را ری‌استارت کنید')}
 async function saveAcct(){try{await api('/panel/account','POST',{current:$('#a_cur').value,user:$('#a_user').value,password:$('#a_new').value});toast('ذخیره شد');$('#a_cur').value='';$('#a_new').value='';await load()}catch(e){toast(e.message,1)}}
-load();setInterval(()=>{if(S&&TAB!=='set'&&!document.querySelector('.ov'))load()},20000);
+load();setInterval(()=>{if(S&&TAB!=='set'&&!document.querySelector('.ov')&&document.activeElement!==$('#cq'))load()},20000);
 </script></body></html>"""
 
 
