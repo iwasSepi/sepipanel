@@ -21,7 +21,7 @@ import os, re, io, sys, json, time, html, base64, secrets, sqlite3, hmac, hashli
 from urllib.parse import quote, urlsplit
 from functools import wraps
 
-from flask import Flask, request, jsonify, session, Response, abort
+from flask import Flask, request, jsonify, session, Response, abort, g
 
 try:
     import qrcode, qrcode.image.svg
@@ -123,6 +123,11 @@ CREATE TABLE IF NOT EXISTS client_inbound(
   keepalive INTEGER DEFAULT -1, dns TEXT DEFAULT '', mtu INTEGER DEFAULT 0, extra_allowed TEXT DEFAULT '',
   last_rx INTEGER DEFAULT 0, last_tx INTEGER DEFAULT 0, last_hs INTEGER DEFAULT 0, endpoint TEXT DEFAULT '',
   PRIMARY KEY(client_id, inbound_id));
+CREATE TABLE IF NOT EXISTS admins(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, pass_hash TEXT NOT NULL,
+  name TEXT DEFAULT '', note TEXT DEFAULT '', enabled INTEGER DEFAULT 1,
+  limit_bytes INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0, expiry INTEGER DEFAULT 0,
+  ver TEXT DEFAULT '', created INTEGER, last_login INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
 """)
 
@@ -135,7 +140,7 @@ def ensure_cols(table, cols):
 
 
 ensure_cols("inbounds", {"obf": "TEXT DEFAULT ''", "exclude_sub": "INTEGER DEFAULT 0"})
-ensure_cols("clients", {"reset_period": "TEXT DEFAULT ''", "last_reset": "INTEGER DEFAULT 0"})
+ensure_cols("clients", {"reset_period": "TEXT DEFAULT ''", "last_reset": "INTEGER DEFAULT 0", "owner_id": "INTEGER DEFAULT 0"})
 try:
     os.chmod(DB_PATH, 0o600)
 except OSError:
@@ -476,10 +481,36 @@ def usage_state(c):
     return "active"
 
 
+def admin_state(a):
+    if not a["enabled"]:
+        return "disabled"
+    if a["expiry"] and now() >= a["expiry"]:
+        return "expired"
+    if a["limit_bytes"] and a["used_bytes"] >= a["limit_bytes"]:
+        return "limit"
+    return "active"
+
+
+ADM_STATE = {}
+
+
+def admin_inbounds(aid):
+    return {r["inbound_id"] for r in q(
+        "SELECT ci.inbound_id FROM client_inbound ci JOIN clients c ON c.id=ci.client_id WHERE c.owner_id=?", (aid,))}
+
+
 def client_state(c):
     if not c["enabled"]:
         return c["reason"] or "disabled"
-    return usage_state(c)
+    st = usage_state(c)
+    if st != "active":
+        return st
+    oid = c["owner_id"] if "owner_id" in c.keys() else 0
+    if oid:
+        a = q("SELECT * FROM admins WHERE id=?", (oid,), True)
+        if a and admin_state(a) != "active":
+            return "admin"      # حجم/اعتبار ادمین صاحب کلاینت تمام شده یا ادمین غیرفعال است
+    return "active"
 
 
 def auto_rule_lines(ib):
@@ -785,6 +816,8 @@ def collect_stats():
               (rx, tx, hs or r["last_hs"], "" if ep == "(none)" else ep, r["cid"], ib["id"]))
             if drx or dtx:
                 x("UPDATE clients SET up_bytes=up_bytes+?, down_bytes=down_bytes+? WHERE id=?", (drx, dtx, r["cid"]))
+                x("UPDATE admins SET used_bytes=used_bytes+? WHERE id=(SELECT owner_id FROM clients WHERE id=?)",
+                  (drx + dtx, r["cid"]))
             if hs:
                 x("UPDATE clients SET last_seen=MAX(last_seen,?) WHERE id=?", (hs, r["cid"]))
     for c in q("SELECT * FROM clients WHERE reset_period!=''"):
@@ -799,6 +832,11 @@ def collect_stats():
         if st != "active":
             x("UPDATE clients SET enabled=0, reason=? WHERE id=?", (st, c["id"]))
             changed |= {r["inbound_id"] for r in q("SELECT inbound_id FROM client_inbound WHERE client_id=?", (c["id"],))}
+    for a in q("SELECT * FROM admins"):       # ادمینی که حجم/زمانش تمام شد یا تمدید شد → کلاینت‌هایش قطع/وصل شود
+        st = admin_state(a)
+        if ADM_STATE.get(a["id"], st) != st:
+            changed |= admin_inbounds(a["id"])
+        ADM_STATE[a["id"]] = st
     if changed:
         w = apply_many(changed)
         if w:
@@ -850,15 +888,37 @@ def base_url():
     return request.host_url.rstrip("/")
 
 
-def auth(fn):
-    @wraps(fn)
-    def w(*a, **k):
-        if not session.get("u") or session.get("v") != setting("sess_ver", "0"):
-            return jsonify(error="auth"), 401
-        if request.method != "GET" and request.headers.get("X-Requested-With") != "sepipanel":
-            return jsonify(error="bad request"), 400
-        return fn(*a, **k)
-    return w
+def _who():
+    """(role, admin_id) یا None. نشست‌های قدیمی بدون role همان مدیر اصلی‌اند."""
+    if not session.get("u"):
+        return None
+    if session.get("role", "super") == "super":
+        return ("super", 0) if session.get("v") == setting("sess_ver", "0") else None
+    a = q("SELECT * FROM admins WHERE id=?", (session.get("aid"),), True)
+    if not a or not a["enabled"] or not a["ver"] or session.get("av") != a["ver"]:
+        return None
+    return ("admin", a["id"])
+
+
+def _guard(super_only):
+    def deco(fn):
+        @wraps(fn)
+        def w(*a, **k):
+            who = _who()
+            if not who:
+                return jsonify(error="auth"), 401
+            if super_only and who[0] != "super":
+                return jsonify(error="دسترسی ندارید"), 403
+            if request.method != "GET" and request.headers.get("X-Requested-With") != "sepipanel":
+                return jsonify(error="bad request"), 400
+            g.role, g.aid = who
+            return fn(*a, **k)
+        return w
+    return deco
+
+
+auth = _guard(True)        # فقط مدیر اصلی (پیش‌فرض همه‌ی مسیرها)
+auth_any = _guard(False)   # مدیر اصلی یا ادمین (فقط مسیرهای کلاینت)
 
 
 @app.errorhandler(Err)
@@ -891,7 +951,7 @@ def ser_client(c):
     links = q("""SELECT ci.*, ib.name AS ib_name FROM client_inbound ci JOIN inbounds ib ON ib.id=ci.inbound_id
                  WHERE ci.client_id=? ORDER BY ib.id""", (c["id"],))
     d = {k: c[k] for k in ("id", "name", "token", "enabled", "reason", "public_key", "limit_bytes", "up_bytes",
-                           "down_bytes", "expiry", "note", "created", "last_seen", "reset_period")}
+                           "down_bytes", "expiry", "note", "created", "last_seen", "reset_period", "owner_id")}
     d["state"] = client_state(c)
     d["sub_url"] = f"{base_url()}/sub/{c['token']}"
     d["online"] = any(l["last_hs"] and now() - l["last_hs"] < 180 for l in links)
@@ -924,8 +984,8 @@ def admin_user():
 
 def check_login(u, p):
     h = setting("admin_hash")
-    ok_p = check_pw(p, h) if h else hmac.compare_digest(p, ADMIN_PASS)
-    return hmac.compare_digest(u, admin_user()) & ok_p
+    ok_p = check_pw(p, h) if h else hmac.compare_digest(p.encode(), ADMIN_PASS.encode())
+    return hmac.compare_digest(u.encode(), admin_user().encode()) & ok_p
 
 
 def panel_cfg():
@@ -1112,6 +1172,8 @@ def panel_account():
     user = str(d.get("user") or admin_user()).strip()
     if not re.fullmatch(r"[A-Za-z0-9_.\-]{3,32}", user):
         raise Err("نام کاربری باید ۳ تا ۳۲ حرف انگلیسی/عدد باشد")
+    if q("SELECT 1 FROM admins WHERE lower(username)=lower(?)", (user,), True):
+        raise Err("این نام کاربری برای یکی از ادمین‌ها استفاده شده است")
     pw = str(d.get("password") or "")
     if pw:
         if len(pw) < 10 or pw == ADMIN_PASS:
@@ -1139,15 +1201,30 @@ def login():
     if n >= 6:
         return jsonify(error="تلاش‌های زیاد؛ چند دقیقه بعد دوباره امتحان کنید"), 429
     d = body()
-    ok = check_login(str(d.get("u", "")), str(d.get("p", "")))
-    if not ok:
-        FAILS[ip] = (n + 1, t)
-        return jsonify(error="نام کاربری یا رمز اشتباه است"), 401
-    FAILS.pop(ip, None)
-    session.permanent = True
-    session["u"] = 1
-    session["v"] = setting("sess_ver", "0")
-    return jsonify(ok=True)
+    u, p = str(d.get("u", "")), str(d.get("p", ""))
+    if check_login(u, p):
+        FAILS.pop(ip, None)
+        session.clear()
+        session.permanent = True
+        session["u"] = 1
+        session["role"] = "super"
+        session["v"] = setting("sess_ver", "0")
+        return jsonify(ok=True, role="super")
+    a = q("SELECT * FROM admins WHERE lower(username)=lower(?)", (u,), True)
+    if a and check_pw(p, a["pass_hash"]):
+        if not a["enabled"]:
+            return jsonify(error="حساب شما غیرفعال شده است؛ با مدیر تماس بگیرید"), 403
+        FAILS.pop(ip, None)
+        session.clear()
+        session.permanent = True
+        session["u"] = 1
+        session["role"] = "admin"
+        session["aid"] = a["id"]
+        session["av"] = a["ver"]
+        x("UPDATE admins SET last_login=? WHERE id=?", (now(), a["id"]))
+        return jsonify(ok=True, role="admin")
+    FAILS[ip] = (n + 1, t)
+    return jsonify(error="نام کاربری یا رمز اشتباه است"), 401
 
 
 @app.post("/api/logout")
@@ -1156,9 +1233,7 @@ def logout():
     return jsonify(ok=True)
 
 
-@app.get("/api/state")
-@auth
-def state():
+def state_super():
     ups = set()
     for t in ("wg", "awg"):
         rc, o, _ = run([t, "show", "interfaces"], timeout=10)
@@ -1171,9 +1246,186 @@ def state():
         clients=[ser_client(c) for c in q("SELECT * FROM clients ORDER BY id DESC")],
         settings=dict(public_url=setting("public_url"), sub_title=setting("sub_title", "WireGuard"), sub_telegram=setting("sub_telegram", ""),
                       update_interval=int(setting("update_interval", "12") or 12)),
+        role="super", admins=[ser_admin(a) for a in q("SELECT * FROM admins ORDER BY id DESC")],
         defaults=inbound_defaults(), panel=panel_info(),
         server=dict(wg=(ver.strip() if rc2 == 0 else ""), awg=(aver.strip() if rc3 == 0 else ""), nat_iface=detect_iface(), qr=bool(qrcode),
                     now=now(), base=base_url()))
+
+
+def ser_admin(a):
+    d = {k: a[k] for k in ("id", "username", "name", "note", "enabled", "limit_bytes", "used_bytes", "expiry",
+                           "created", "last_login")}
+    d["state"] = admin_state(a)
+    cs = q("SELECT COUNT(*) n, COALESCE(SUM(up_bytes+down_bytes),0) u, "
+           "COALESCE(SUM(CASE WHEN last_seen>? THEN 1 ELSE 0 END),0) o FROM clients WHERE owner_id=?",
+           (now() - 180, a["id"]), True)
+    d["clients"], d["clients_used"], d["online"] = cs["n"], cs["u"], cs["o"]
+    return d
+
+
+def state_admin():
+    a = q("SELECT * FROM admins WHERE id=?", (g.aid,), True)
+    ups = set()
+    for t in ("wg", "awg"):
+        rc, o, _ = run([t, "show", "interfaces"], timeout=10)
+        if rc == 0:
+            ups |= set(o.split())
+    ibs = [dict(id=r["id"], name=r["name"], remark=r["remark"], address4=r["address4"], awg=is_awg(r), enabled=1,
+                up=r["name"] in ups, exclude_sub=r["exclude_sub"])
+           for r in q("SELECT * FROM inbounds WHERE enabled=1 ORDER BY id")]
+    return jsonify(role="admin", inbounds=ibs, me=ser_admin(a), settings={}, admins=[],
+                   clients=[ser_client(c) for c in q("SELECT * FROM clients WHERE owner_id=? ORDER BY id DESC", (g.aid,))],
+                   panel=dict(user=a["username"]), server=dict(qr=bool(qrcode), now=now(), base=base_url()))
+
+
+@app.get("/api/state")
+@auth_any
+def state():
+    return state_super() if g.role == "super" else state_admin()
+
+
+def owned(cid):
+    """کلاینت را برمی‌گرداند؛ ادمین فقط به کلاینت‌های خودش دسترسی دارد."""
+    c = q("SELECT * FROM clients WHERE id=?", (cid,), True) or abort(404)
+    if g.role == "admin" and c["owner_id"] != g.aid:
+        abort(404)
+    return c
+
+
+def require_active_admin():
+    if g.role != "admin":
+        return
+    st = admin_state(q("SELECT * FROM admins WHERE id=?", (g.aid,), True))
+    if st != "active":
+        raise Err({"expired": "اعتبار حساب شما تمام شده", "limit": "حجم حساب شما تمام شده",
+                   "disabled": "حساب شما غیرفعال است"}[st] + "؛ برای تمدید با مدیر تماس بگیرید")
+
+
+def admin_links(cid, links):
+    """لینک‌های کلاینت یک ادمین: فقط اینباندهای فعال؛ تنظیمات ویژه (IP/DNS/AllowedIPs...) را نمی‌تواند تغییر دهد."""
+    def keep(cur):
+        return dict(inbound_id=cur["inbound_id"], ip4=cur["ip4"], allowed_ips=cur["allowed_ips"], keepalive=cur["keepalive"],
+                    dns=cur["dns"], mtu=cur["mtu"] or "", extra_allowed=cur["extra_allowed"])
+    out, ids = [], set()
+    for L in links or []:
+        iid = num(L.get("inbound_id"))
+        if iid in ids:
+            continue
+        if not q("SELECT 1 FROM inbounds WHERE id=? AND enabled=1", (iid,), True):
+            raise Err("اینباند انتخاب‌شده فعال نیست یا وجود ندارد")
+        ids.add(iid)
+        cur = q("SELECT * FROM client_inbound WHERE client_id=? AND inbound_id=?", (cid, iid), True) if cid else None
+        out.append(keep(cur) if cur else dict(inbound_id=iid))
+    if cid:   # لینک به اینباندی که الان غیرفعال شده و ادمین نمی‌بیند، دست‌نخورده بماند
+        for r in q("""SELECT ci.*, ib.enabled AS ib_en FROM client_inbound ci JOIN inbounds ib ON ib.id=ci.inbound_id
+                      WHERE ci.client_id=?""", (cid,)):
+            if r["inbound_id"] not in ids and not r["ib_en"]:
+                out.append(keep(r))
+    if not out:
+        raise Err("حداقل یک اینباند انتخاب کنید")
+    return out
+
+
+# ------------------------------ مدیریت ادمین‌ها (فقط مدیر اصلی) ------------------------------
+def parse_admin(d, cur=None):
+    user = str(d.get("username") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{3,32}", user):
+        raise Err("نام کاربری ادمین باید ۳ تا ۳۲ حرف انگلیسی/عدد/_ . - باشد")
+    if user.lower() == admin_user().lower():
+        raise Err("این نام کاربری برای مدیر اصلی است")
+    if q("SELECT 1 FROM admins WHERE lower(username)=lower(?) AND id!=?", (user, cur["id"] if cur else 0), True):
+        raise Err("این نام کاربری قبلاً استفاده شده")
+    pw = str(d.get("password") or "")
+    if (not cur or pw) and len(pw) < 8:
+        raise Err("رمز عبور باید حداقل ۸ کاراکتر باشد")
+    try:
+        gb = float(d.get("limit_gb") or 0)
+    except Exception:
+        raise Err("حجم نامعتبر است")
+    if gb < 0:
+        raise Err("حجم نمی‌تواند منفی باشد")
+    return dict(username=user, password=pw, name=oneline(d.get("name"))[:64], note=str(d.get("note") or "")[:500],
+                limit_bytes=int(gb * 1024 ** 3), expiry=num(d.get("expiry"), 0, 0, None, "تاریخ انقضا"))
+
+
+@app.post("/api/admins")
+@auth
+def admin_create():
+    o = parse_admin(body())
+    aid = x("""INSERT INTO admins(username,pass_hash,name,note,enabled,limit_bytes,used_bytes,expiry,ver,created)
+               VALUES(?,?,?,?,1,?,0,?,?,?)""",
+            (o["username"], hash_pw(o["password"]), o["name"], o["note"], o["limit_bytes"], o["expiry"],
+             secrets.token_hex(8), now()))
+    return jsonify(ok=True, id=aid)
+
+
+@app.put("/api/admins/<int:aid>")
+@auth
+def admin_update(aid):
+    cur = q("SELECT * FROM admins WHERE id=?", (aid,), True) or abort(404)
+    o = parse_admin(body(), cur)
+    x("UPDATE admins SET username=?, name=?, note=?, limit_bytes=?, expiry=? WHERE id=?",
+      (o["username"], o["name"], o["note"], o["limit_bytes"], o["expiry"], aid))
+    if o["password"]:
+        x("UPDATE admins SET pass_hash=?, ver=? WHERE id=?", (hash_pw(o["password"]), secrets.token_hex(8), aid))
+    return jsonify(ok=True, warn=apply_many(admin_inbounds(aid)))
+
+
+@app.delete("/api/admins/<int:aid>")
+@auth
+def admin_delete(aid):
+    q("SELECT 1 FROM admins WHERE id=?", (aid,), True) or abort(404)
+    ids = admin_inbounds(aid)
+    if body().get("delete_clients"):
+        x("DELETE FROM clients WHERE owner_id=?", (aid,))
+    else:
+        x("UPDATE clients SET owner_id=0 WHERE owner_id=?", (aid,))
+    x("DELETE FROM admins WHERE id=?", (aid,))
+    ADM_STATE.pop(aid, None)
+    return jsonify(ok=True, warn=apply_many(ids))
+
+
+@app.post("/api/admins/<int:aid>/toggle")
+@auth
+def admin_toggle(aid):
+    a = q("SELECT * FROM admins WHERE id=?", (aid,), True) or abort(404)
+    x("UPDATE admins SET enabled=? WHERE id=?", (0 if a["enabled"] else 1, aid))
+    return jsonify(ok=True, warn=apply_many(admin_inbounds(aid)))
+
+
+@app.post("/api/admins/<int:aid>/reset-traffic")
+@auth
+def admin_reset_traffic(aid):
+    q("SELECT 1 FROM admins WHERE id=?", (aid,), True) or abort(404)
+    x("UPDATE admins SET used_bytes=0 WHERE id=?", (aid,))
+    return jsonify(ok=True, warn=apply_many(admin_inbounds(aid)))
+
+
+@app.post("/api/admins/<int:aid>/renew")
+@auth
+def admin_renew(aid):
+    a = q("SELECT * FROM admins WHERE id=?", (aid,), True) or abort(404)
+    d = body()
+    try:
+        gb = float(d.get("add_gb") or 0)
+    except Exception:
+        raise Err("حجم نامعتبر است")
+    days = num(d.get("add_days"), 0, 0, 36500, "تعداد روز")
+    if gb < 0:
+        raise Err("حجم نمی‌تواند منفی باشد")
+    lim, used, exp = a["limit_bytes"], a["used_bytes"], a["expiry"]
+    if d.get("reset_usage"):
+        used = 0
+    if gb:
+        lim = (lim or 0) + int(gb * 1024 ** 3)
+    if d.get("reset_time"):
+        if not days:
+            raise Err("برای ریست زمان، تعداد روز را وارد کنید (از همین الان شمرده می‌شود)")
+        exp = now() + days * 86400
+    elif days:
+        exp = (max(exp, now()) if exp else now()) + days * 86400
+    x("UPDATE admins SET limit_bytes=?, used_bytes=?, expiry=? WHERE id=?", (lim, used, exp, aid))
+    return jsonify(ok=True, warn=apply_many(admin_inbounds(aid)))
 
 
 @app.post("/api/inbounds")
@@ -1229,21 +1481,25 @@ def inbound_conf(iid):
 
 
 @app.post("/api/clients")
-@auth
+@auth_any
 def client_create():
     d = body()
     b = parse_client_basic(d)
     count = num(d.get("count"), 1, 1, 200, "تعداد")
+    links, owner = d.get("links"), 0
+    if g.role == "admin":
+        require_active_admin()
+        links, owner = admin_links(0, links), g.aid
     touched = set()
     for i in range(count):
         priv = gen_private()
         name = b["name"] if count == 1 else f"{b['name']}-{i + 1}"
-        cid = x("""INSERT INTO clients(name,token,enabled,private_key,public_key,limit_bytes,expiry,note,created,reset_period,last_reset)
-                   VALUES(?,?,1,?,?,?,?,?,?,?,?)""",
+        cid = x("""INSERT INTO clients(name,token,enabled,private_key,public_key,limit_bytes,expiry,note,created,reset_period,last_reset,owner_id)
+                   VALUES(?,?,1,?,?,?,?,?,?,?,?,?)""",
                 (name, secrets.token_urlsafe(16), priv, pub_from_private(priv), b["limit_bytes"], b["expiry"], b["note"],
-                 now(), b["reset_period"], now()))
+                 now(), b["reset_period"], now(), owner))
         try:
-            touched |= save_links(cid, d.get("links"))
+            touched |= save_links(cid, links)
         except Err:
             x("DELETE FROM clients WHERE id=?", (cid,))
             raise
@@ -1251,15 +1507,19 @@ def client_create():
 
 
 @app.put("/api/clients/<int:cid>")
-@auth
+@auth_any
 def client_update(cid):
-    cur = q("SELECT * FROM clients WHERE id=?", (cid,), True) or abort(404)
+    cur = owned(cid)
     d = body()
     b = parse_client_basic(d)
+    links = d.get("links")
+    if g.role == "admin":
+        require_active_admin()
+        links = admin_links(cid, links)
     x("""UPDATE clients SET name=?, note=?, limit_bytes=?, expiry=?, reset_period=?,
          last_reset=CASE WHEN reset_period!=? THEN ? ELSE last_reset END WHERE id=?""",
       (b["name"], b["note"], b["limit_bytes"], b["expiry"], b["reset_period"], b["reset_period"], now(), cid))
-    touched = save_links(cid, d.get("links"))
+    touched = save_links(cid, links)
     c = q("SELECT * FROM clients WHERE id=?", (cid,), True)
     if not c["enabled"] and c["reason"] in ("expired", "limit") and usage_state(c) == "active":
         x("UPDATE clients SET enabled=1, reason='' WHERE id=?", (cid,))
@@ -1271,21 +1531,22 @@ def client_inbounds(cid):
 
 
 @app.delete("/api/clients/<int:cid>")
-@auth
+@auth_any
 def client_delete(cid):
-    q("SELECT 1 FROM clients WHERE id=?", (cid,), True) or abort(404)
+    owned(cid)
     ids = client_inbounds(cid)
     x("DELETE FROM clients WHERE id=?", (cid,))
     return jsonify(ok=True, warn=apply_many(ids))
 
 
 @app.post("/api/clients/<int:cid>/toggle")
-@auth
+@auth_any
 def client_toggle(cid):
-    c = q("SELECT * FROM clients WHERE id=?", (cid,), True) or abort(404)
+    c = owned(cid)
     if c["enabled"]:
         x("UPDATE clients SET enabled=0, reason='disabled' WHERE id=?", (cid,))
     else:
+        require_active_admin()
         if usage_state(c) != "active":
             raise Err("حجم یا اعتبار کلاینت تمام شده؛ اول تمدید یا ریست ترافیک کنید")
         x("UPDATE clients SET enabled=1, reason='' WHERE id=?", (cid,))
@@ -1293,9 +1554,9 @@ def client_toggle(cid):
 
 
 @app.post("/api/clients/<int:cid>/reset-traffic")
-@auth
+@auth_any
 def client_reset(cid):
-    c = q("SELECT * FROM clients WHERE id=?", (cid,), True) or abort(404)
+    c = owned(cid)
     x("UPDATE clients SET up_bytes=0, down_bytes=0 WHERE id=?", (cid,))
     if not c["enabled"] and c["reason"] == "limit" and usage_state(q("SELECT * FROM clients WHERE id=?", (cid,), True)) == "active":
         x("UPDATE clients SET enabled=1, reason='' WHERE id=?", (cid,))
@@ -1303,17 +1564,17 @@ def client_reset(cid):
 
 
 @app.post("/api/clients/<int:cid>/reset-token")
-@auth
+@auth_any
 def client_reset_token(cid):
-    q("SELECT 1 FROM clients WHERE id=?", (cid,), True) or abort(404)
+    owned(cid)
     x("UPDATE clients SET token=? WHERE id=?", (secrets.token_urlsafe(16), cid))
     return jsonify(ok=True)
 
 
 @app.post("/api/clients/<int:cid>/regen-keys")
-@auth
+@auth_any
 def client_regen(cid):
-    q("SELECT 1 FROM clients WHERE id=?", (cid,), True) or abort(404)
+    owned(cid)
     priv = gen_private()
     x("UPDATE clients SET private_key=?, public_key=? WHERE id=?", (priv, pub_from_private(priv), cid))
     x("UPDATE client_inbound SET last_rx=0, last_tx=0 WHERE client_id=?", (cid,))
@@ -1815,6 +2076,7 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
 .login h1{margin:0 0 18px;font-size:20px;text-align:center}.login button.p{width:100%}
 .empty{color:var(--mut);text-align:center;padding:36px 0;background:var(--card);border:1px dashed var(--line);border-radius:14px}
 .mut{color:var(--mut)}img.qr{width:210px;max-width:100%;display:block;margin:10px auto;background:#fff;padding:10px;border-radius:12px}
+.fsel{background:var(--field);border:1px solid var(--line);border-radius:9px;padding:8px 12px;color:var(--ink);outline:0;max-width:60vw}
 :focus-visible{outline:2px solid var(--sky);outline-offset:2px}
 @media(max-width:860px){
  .shell{grid-template-columns:1fr}.side{position:static;height:auto;border-inline-end:0;border-bottom:1px solid var(--line)}
@@ -1829,7 +2091,7 @@ const fmtB=n=>{n=+n||0;const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&
 const fmtD=t=>t?new Date(t*1000).toLocaleDateString('fa-IR'):'نامحدود';
 const ago=t=>{if(!t)return 'هرگز';const s=Math.max(0,S.server.now-t+((Date.now()/1000)-S.local));if(s<90)return 'همین الان';if(s<3600)return Math.floor(s/60)+' دقیقه پیش';if(s<86400)return Math.floor(s/3600)+' ساعت پیش';return Math.floor(s/86400)+' روز پیش'};
 const BASE=location.pathname.replace(/\/+$/,'');
-let S=null,TAB='cli';
+let S=null,TAB='cli',CF='all';
 function toast(m,e){const d=document.createElement('div');d.textContent=m;if(e)d.className='e';$('#toast').appendChild(d);setTimeout(()=>d.remove(),e?7000:2500)}
 async function api(p,m='GET',b){const r=await fetch(BASE+'/api'+p,{method:m,headers:{'Content-Type':'application/json','X-Requested-With':'sepipanel'},body:b?JSON.stringify(b):undefined});
  if(r.status==401){showLogin();throw new Error('نیاز به ورود')}
@@ -1849,26 +2111,30 @@ const IC={
  link:'<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>',
  info:'<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>',
  save:'<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
- user:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>'};
+ user:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+ admin:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.2"/><path d="M8.2 16.2c.8-1.6 2.1-2.2 3.8-2.2s3 .6 3.8 2.2"/>'};
 const ic=n=>`<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${IC[n]||''}</svg>`;
 function showLogin(){$('#app').innerHTML=`<div class="login"><div class="lg2">${ic('shield')}</div><h1>ورود به SepiPanel</h1><div class="fg"><label>نام کاربری</label><input id="lu" autocomplete="username"></div>
 <div class="fg"><label>رمز عبور</label><input id="lp" type="password" autocomplete="current-password"></div><button class="p" onclick="doLogin()">ورود</button></div>`;
  $('#lp').onkeydown=e=>{if(e.key==='Enter')doLogin()}}
 async function doLogin(){try{await api('/login','POST',{u:$('#lu').value,p:$('#lp').value});load()}catch(e){toast(e.message,1)}}
 async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1)}}
-const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad']};
-const NAV=[['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
+const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad']};
+const NAV=[['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
+const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.']];
+const isA=()=>S&&S.role==='admin';
 function render(){
- const on=S.clients.filter(c=>c.online).length,tot=S.clients.reduce((a,c)=>a+c.up_bytes+c.down_bytes,0),cur=NAV.find(n=>n[0]==TAB);
+ const NV=isA()?NAV_A:NAV;if(!NV.find(n=>n[0]==TAB))TAB='cli';
+ const on=S.clients.filter(c=>c.online).length,tot=S.clients.reduce((a,c)=>a+c.up_bytes+c.down_bytes,0),cur=NV.find(n=>n[0]==TAB);
  $('#app').innerHTML=`<div class="shell"><aside class="side"><div class="brand"><span class="lg">${ic('shield')}</span><div><b>SepiPanel</b><small>مدیریت WireGuard</small></div></div>
- <nav class="nav">${NAV.map(([k,l,i])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${ic(i)}<span>${l}</span></button>`).join('')}<button onclick="logout()">${ic('logout')}<span>خروج</span></button></nav></aside>
- <div class="main"><header class="tb"><span class="mut sm">${esc(S.server.wg||'wireguard-tools یافت نشد!')}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
+ <nav class="nav">${NV.map(([k,l,i])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${ic(i)}<span>${l}</span></button>`).join('')}<button onclick="logout()">${ic('logout')}<span>خروج</span></button></nav></aside>
+ <div class="main"><header class="tb"><span class="mut sm">${isA()?'پنل ادمین':esc(S.server.wg||'wireguard-tools یافت نشد!')}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
  <div class="wrap"><h1 class="pt">${cur[1]}</h1><p class="ps">${cur[3]}</p>
- <div class="stats"><div class="st"><span class="si g">${ic('server')}</span><span class="l">اینباند فعال</span><b>${S.inbounds.filter(i=>i.up).length} / ${S.inbounds.length}</b></div>
+ <div class="stats"><div class="st"><span class="si g">${ic('server')}</span><span class="l">اینباند فعال</span><b>${isA()?S.inbounds.length:S.inbounds.filter(i=>i.up).length+' / '+S.inbounds.length}</b></div>
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
  <div class="st"><span class="si bl">${ic('pulse')}</span><span class="l">آنلاین</span><b>${on}</b></div>
  <div class="st"><span class="si o">${ic('db')}</span><span class="l">مصرف کل</span><b>${fmtB(tot)}</b></div></div>
- ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():setHTML()}</div></div></div>`}
+ ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():setHTML()}</div></div></div>`}
 async function logout(){await api('/logout','POST');showLogin()}
 /* ---------- اینباندها ---------- */
 function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
@@ -1935,13 +2201,21 @@ function editInb(id){const i=S.inbounds.find(x=>x.id==id);formModal('ویرای�
 function delInb(id,n){if(confirm(`اینباند ${n} و اتصال همه کلاینت‌هایش حذف شود؟`))act(()=>api('/inbounds/'+id,'DELETE'),'حذف شد')}
 async function showConf(id){try{const r=await api('/inbounds/'+id+'/conf');const m=modal(`<h2>کانفیگ سرور</h2><pre class="cf">${esc(r.conf)}</pre><div class="mfoot"><button class="s" id="x">بستن</button></div>`);m.querySelector('#x').onclick=()=>m.remove()}catch(e){toast(e.message,1)}}
 /* ---------- کلاینت‌ها ---------- */
-function cliHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newCli()">+ کلاینت جدید</button></div>`+
- (S.clients.map(c=>{const u=c.up_bytes+c.down_bytes,pct=c.limit_bytes?Math.min(100,u*100/c.limit_bytes):0,st=STL[c.state]||[c.state,''];
+const admName=id=>{const a=(S.admins||[]).find(x=>x.id==id);return a?a.username:'#'+id};
+const dleft=e=>e?' ('+Math.max(0,Math.ceil((e-Date.now()/1000)/86400))+' روز مانده)':'';
+function meCard(){const m=S.me;if(!m)return '';const u=m.used_bytes,pct=m.limit_bytes?Math.min(100,u*100/m.limit_bytes):0,st=STL[m.state]||[m.state,''];
+ return `<div class="card ${m.state=='active'?'up':''}"><div class="row"><h3>${esc(m.name||m.username)}<small>حساب ادمین</small></h3><span class="b ${st[1]}">${st[0]}</span></div><div class="pg"><i style="width:${pct}%"></i></div>
+ <div class="meta"><span>حجم مصرفی: <b>${fmtB(u)}</b> / <b>${m.limit_bytes?fmtB(m.limit_bytes):'نامحدود'}</b></span><span>باقی‌مانده: <b>${m.limit_bytes?fmtB(Math.max(0,m.limit_bytes-u)):'نامحدود'}</b></span>
+ <span>انقضا: <b style="direction:rtl">${fmtD(m.expiry)}${dleft(m.expiry)}</b></span></div>
+ ${m.state!='active'?'<div style="color:#f87171">حجم یا اعتبار حساب شما تمام شده؛ کلاینت‌های شما تا تمدید توسط مدیر غیرفعال‌اند.</div>':''}</div>`}
+function cliHTML(){const flt=S.clients.filter(c=>isA()||CF==='all'||(CF==='0'?!c.owner_id:String(c.owner_id)===CF));
+ return (isA()?meCard():'')+`<div class="bar2">${isA()||!S.admins.length?'<span></span>':`<select class="fsel" onchange="CF=this.value;render()"><option value="all">همه کلاینت‌ها</option><option value="0" ${CF==='0'?'selected':''}>مدیر اصلی</option>${S.admins.map(a=>`<option value="${a.id}" ${CF==String(a.id)?'selected':''}>ادمین: ${esc(a.username)}</option>`).join('')}</select>`}<button class="p" onclick="newCli()">+ کلاینت جدید</button></div>`+
+ (flt.map(c=>{const u=c.up_bytes+c.down_bytes,pct=c.limit_bytes?Math.min(100,u*100/c.limit_bytes):0,st=STL[c.state]||[c.state,''];
  return `<article class="card ${c.state=='active'?'up':''}"><div class="row"><h3><span class="dot ${c.online?'on':''}"></span>${esc(c.name)}<small>${esc(c.note)}</small></h3><span class="b ${st[1]}">${st[0]}</span></div>
  <div class="pg"><i style="width:${c.limit_bytes?pct:0}%"></i></div>
  <div class="meta"><span>مصرف: <b>${fmtB(u)}</b> / <b>${c.limit_bytes?fmtB(c.limit_bytes):'نامحدود'}</b></span><span>↑ ${fmtB(c.up_bytes)} &nbsp; ↓ ${fmtB(c.down_bytes)}</span>
  <span>انقضا: <b style="direction:rtl">${fmtD(c.expiry)}</b></span><span>آخرین اتصال: <b style="direction:rtl">${ago(c.last_seen)}</b></span></div>
- <div>${c.links.map(l=>`<span class="tag">${esc(l.ib_name)} · ${esc(l.ip4)}</span>`).join('')||'<span class="mut">بدون اینباند</span>'}</div>
+ <div>${!isA()&&c.owner_id?`<span class="tag" style="color:#c4b5fd">ادمین: ${esc(admName(c.owner_id))}</span>`:''}${c.links.map(l=>`<span class="tag">${esc(l.ib_name)} · ${esc(l.ip4)}</span>`).join('')||'<span class="mut">بدون اینباند</span>'}</div>
  <div class="acts"><button class="s" onclick="subModal(${c.id})">لینک ساب / QR</button><button class="s" onclick="editCli(${c.id})">ویرایش</button>
  <button class="s" onclick="act(()=>api('/clients/${c.id}/toggle','POST'))">${c.enabled?'غیرفعال‌سازی':'فعال‌سازی'}</button>
  <button class="s" onclick="act(()=>api('/clients/${c.id}/reset-traffic','POST'),'ترافیک ریست شد')">ریست ترافیک</button>
@@ -1951,7 +2225,7 @@ const CLI=[{k:'name',l:'نام کلاینت',rtl:1},{k:'count',l:'تعداد (س
  {k:'reset_period',l:'ریست خودکار ترافیک',t:'select',opts:[['','هرگز'],['daily','روزانه'],['weekly','هفتگی'],['monthly','ماهانه (هر ۳۰ روز)']]}];
 function linkBlock(ib,L){const v=L||{};const f=(k,l,ph)=>`<div class="fg"><label>${l}</label><input class="l_${k}" value="${esc(v[k]??'')}" placeholder="${ph||''}"></div>`;
  return `<div class="lk" data-ib="${ib.id}"><label class="chk"><input type="checkbox" class="lkc" ${L?'checked':''}> <b>${esc(ib.name)}</b> <span class="mut">${esc(ib.remark)} · ${esc(ib.address4)}</span></label>
- <details><summary>تنظیمات ویژه این کلاینت در این اینباند</summary><div class="g2">${f('ip4','IPv4 ثابت','خودکار')}${f('allowed_ips','AllowedIPs کلاینت','پیش‌فرض اینباند')}
+ <details ${isA()?'hidden':''}><summary>تنظیمات ویژه این کلاینت در این اینباند</summary><div class="g2">${f('ip4','IPv4 ثابت','خودکار')}${f('allowed_ips','AllowedIPs کلاینت','پیش‌فرض اینباند')}
  ${f('keepalive','Keepalive','پیش‌فرض اینباند (۰=خاموش)')}${f('dns','DNS','پیش‌فرض اینباند')}${f('mtu','MTU','پیش‌فرض اینباند')}${f('extra_allowed','AllowedIPs اضافه سمت سرور','مثلا 192.168.50.0/24')}</div></details></div>`}
 function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_bytes/1024**3).toFixed(3):0}:{limit_gb:0,count:1};
  const fields=CLI.filter(f=>!f.create||!c);
@@ -1979,6 +2253,41 @@ function subModal(id){const c=S.clients.find(x=>x.id==id);const u=c.sub_url;
  m.querySelector('#b1').onclick=()=>copy(u);m.querySelector('#x').onclick=()=>m.remove();
  m.querySelector('#b2').onclick=async()=>{if(confirm('لینک قبلی از کار می‌افتد. ادامه؟')&&await act(()=>api('/clients/'+id+'/reset-token','POST'),'لینک جدید ساخته شد'))m.remove()};
  m.querySelector('#b3').onclick=async()=>{if(confirm('کلیدهای کلاینت عوض می‌شود و کانفیگ‌های قبلی کار نمی‌کنند. ادامه؟')&&await act(()=>api('/clients/'+id+'/regen-keys','POST'),'کلیدها عوض شد'))m.remove()}}
+/* ---------- ادمین‌ها ---------- */
+function admHTML(){return `<div class="bar2"><span></span><button class="p" onclick="admModal(null)">+ ادمین جدید</button></div>`+
+ (S.admins.map(a=>{const pct=a.limit_bytes?Math.min(100,a.used_bytes*100/a.limit_bytes):0,st=STL[a.state]||[a.state,''];
+ return `<article class="card ${a.state=='active'?'up':''}"><div class="row"><h3><span class="dot ${a.online?'on':''}"></span>${esc(a.username)}<small>${esc(a.name)} ${esc(a.note)}</small></h3><span class="b ${st[1]}">${st[0]}</span></div>
+ <div class="pg"><i style="width:${pct}%"></i></div>
+ <div class="meta"><span>مصرف: <b>${fmtB(a.used_bytes)}</b> / <b>${a.limit_bytes?fmtB(a.limit_bytes):'نامحدود'}</b></span><span>باقی‌مانده: <b>${a.limit_bytes?fmtB(Math.max(0,a.limit_bytes-a.used_bytes)):'نامحدود'}</b></span>
+ <span>انقضا: <b style="direction:rtl">${fmtD(a.expiry)}${dleft(a.expiry)}</b></span><span>کلاینت‌ها: <b>${a.clients}</b> (آنلاین ${a.online})</span><span>آخرین ورود: <b style="direction:rtl">${ago(a.last_login)}</b></span></div>
+ <div class="acts"><button class="s" onclick="renewAdm(${a.id})">تمدید / افزودن</button><button class="s" onclick="admModal(${a.id})">ویرایش</button>
+ <button class="s" onclick="if(confirm('مصرف حجم این ادمین صفر شود؟'))act(()=>api('/admins/${a.id}/reset-traffic','POST'),'حجم ریست شد')">ریست حجم</button>
+ <button class="s" onclick="CF='${a.id}';TAB='cli';render()">کلاینت‌ها</button>
+ <button class="s" onclick="act(()=>api('/admins/${a.id}/toggle','POST'))">${a.enabled?'غیرفعال‌سازی':'فعال‌سازی'}</button>
+ <button class="s d" onclick="delAdm(${a.id},'${esc(a.username)}')">حذف</button></div></article>`}).join('')||'<div class="empty">هنوز ادمینی نساخته‌اید.</div>')}
+function admModal(id){const a=id?S.admins.find(x=>x.id==id):null;const v=a||{username:'',name:'',note:'',limit_bytes:0,expiry:0};const gb=v.limit_bytes?+(v.limit_bytes/1024**3).toFixed(3):0;
+ const m=modal(`<h2>${a?'ویرایش ادمین':'ادمین جدید'}</h2>
+ <div class="fg"><label>نام کاربری ورود</label><input id="ad_u" value="${esc(v.username)}" autocomplete="off"></div>
+ <div class="fg"><label>رمز عبور${a?' (خالی = بدون تغییر)':''}</label><input id="ad_p" autocomplete="new-password" placeholder="حداقل ۸ کاراکتر"><div style="margin-top:4px"><button class="s" type="button" id="ad_r">ساخت رمز تصادفی</button></div></div>
+ <div class="fg"><label>نام نمایشی</label><input id="ad_n" value="${esc(v.name)}" style="direction:rtl;text-align:right"></div>
+ <div class="fg"><label>یادداشت</label><input id="ad_t" value="${esc(v.note)}" style="direction:rtl;text-align:right"></div>
+ <div class="fg"><label>سقف حجم کل (گیگابایت)</label><input id="ad_g" type="number" step="any" value="${gb}"><small>۰ = نامحدود. ترافیک مصرفی همهٔ کلاینت‌های این ادمین از این سقف کم می‌شود؛ با تمام‌شدن آن، کلاینت‌هایش قطع می‌شوند.</small></div>
+ <div class="fg"><label>تاریخ انقضا</label><input type="date" id="ad_e" value="${v.expiry?new Date(v.expiry*1000).toISOString().slice(0,10):''}"><small>خالی = نامحدود. بعد از انقضا کلاینت‌های ادمین قطع می‌شوند.</small>
+ <div style="margin-top:4px"><button class="s" type="button" data-d="30">+۳۰ روز</button> <button class="s" type="button" data-d="90">+۹۰ روز</button> <button class="s" type="button" data-d="0">نامحدود</button></div></div>
+ <div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">${ic('save')}ذخیره</button></div>`);
+ m.querySelector('#ad_r').onclick=()=>{m.querySelector('#ad_p').value=[...crypto.getRandomValues(new Uint8Array(12))].map(b=>'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b%55]).join('')};
+ m.querySelectorAll('[data-d]').forEach(b=>b.onclick=()=>{const d=+b.dataset.d,e=m.querySelector('#ad_e');if(!d){e.value='';return}const base=a&&a.expiry*1000>Date.now()?a.expiry*1000:Date.now();e.value=new Date(base+d*864e5).toISOString().slice(0,10)});
+ m.querySelector('#mc').onclick=()=>m.remove();
+ m.querySelector('#ms').onclick=async()=>{const ev=m.querySelector('#ad_e').value;const o={username:m.querySelector('#ad_u').value.trim(),password:m.querySelector('#ad_p').value,name:m.querySelector('#ad_n').value,note:m.querySelector('#ad_t').value,limit_gb:m.querySelector('#ad_g').value,expiry:ev?Math.floor(new Date(ev+'T23:59:59').getTime()/1000):0};
+  if(await act(()=>api(a?'/admins/'+a.id:'/admins',a?'PUT':'POST',o),'ذخیره شد'))m.remove()}}
+function renewAdm(id){const a=S.admins.find(x=>x.id==id);
+ formModal('تمدید / افزودن — '+esc(a.username),[{s:`وضعیت فعلی: مصرف ${fmtB(a.used_bytes)} از ${a.limit_bytes?fmtB(a.limit_bytes):'نامحدود'} · انقضا ${fmtD(a.expiry)}`},
+  {k:'add_gb',l:'افزودن حجم (گیگابایت)',t:'number',h:'به سقف حجم فعلی اضافه می‌شود'},
+  {k:'add_days',l:'افزودن زمان (روز)',t:'number',h:'به تاریخ انقضای فعلی اضافه می‌شود؛ اگر منقضی شده یا نامحدود بوده، از امروز شمرده می‌شود'},
+  {k:'reset_usage',l:'ریست حجم مصرفی (مصرف از صفر شروع شود)',t:'check'},
+  {k:'reset_time',l:'ریست زمان (به‌جای افزودن، روزهای بالا از همین الان شمرده شود)',t:'check'}],{add_gb:0,add_days:0},false,
+  o=>act(()=>api('/admins/'+id+'/renew','POST',o),'انجام شد'))}
+function delAdm(id,n){if(!confirm(`ادمین ${n} حذف شود؟`))return;const dc=confirm('کلاینت‌های این ادمین هم حذف شوند؟\nتأیید = حذف کلاینت‌ها   |   انصراف = انتقال به مدیر اصلی');act(()=>api('/admins/'+id,'DELETE',{delete_clients:dc}),'حذف شد')}
 /* ---------- تنظیمات ---------- */
 function setHTML(){const s=S.settings,p=S.panel,sv=S.server;return `
 ${p.default_pass?`<div class="card" style="border-inline-start:4px solid var(--bad)"><b>هشدار امنیتی:</b> رمز پیش‌فرض داخل فایل هنوز فعال است. همین حالا از «حساب مدیر» عوضش کن.</div>`:''}
