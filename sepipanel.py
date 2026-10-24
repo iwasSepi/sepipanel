@@ -17,7 +17,7 @@ SepiPanel — پنل مدیریت WireGuard (تک‌فایل)
     add-apt-repository -y ppa:amnezia/ppa && apt install -y amneziawg amneziawg-tools
 پورت/دامنه/HTTPS/مسیر مخفی/رمز را از تب «تنظیمات» عوض کنید. اگر قفل شدید:  python3 sepipanel.py --reset
 """
-import os, re, io, sys, json, time, html, base64, secrets, sqlite3, hmac, hashlib, shutil, socket, ssl, ipaddress, subprocess, threading, logging
+import os, re, io, sys, json, time, html, base64, secrets, sqlite3, hmac, hashlib, shutil, socket, ssl, ipaddress, subprocess, threading, logging, collections, platform
 from urllib.parse import quote, urlsplit
 from functools import wraps
 
@@ -1233,6 +1233,140 @@ def logout():
     return jsonify(ok=True)
 
 
+# ------------------------------ وضعیت سیستم (فقط مدیر اصلی) ------------------------------
+PROC_START = time.time()
+HIST = collections.deque(maxlen=180)      # ۱۸۰ نمونه × ۵ ثانیه = ۱۵ دقیقه اخیر
+_PREV = {"cpu": None, "net": None}
+
+
+def _rd(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _cpu_times():
+    f = _rd("/proc/stat").split("\n", 1)[0].split()
+    if len(f) < 5:
+        return None
+    v = [int(a) for a in f[1:9]]
+    return sum(v), v[3] + (v[4] if len(v) > 4 else 0)
+
+
+def _meminfo():
+    d = {}
+    for ln in _rd("/proc/meminfo").splitlines():
+        k, _, v = ln.partition(":")
+        try:
+            d[k] = int(v.split()[0]) * 1024
+        except Exception:
+            pass
+    return d
+
+
+def _net_counters(excl):
+    """(rx, tx) کارت‌های واقعی سرور و (rx, tx) اینترفیس‌های وایرگارد پنل"""
+    rx = tx = wrx = wtx = 0
+    for ln in _rd("/proc/net/dev").splitlines()[2:]:
+        name, _, rest = ln.partition(":")
+        f = rest.split()
+        if len(f) < 9:
+            continue
+        name = name.strip()
+        r, t = int(f[0]), int(f[8])
+        if name in excl:
+            wrx += r; wtx += t
+        elif name != "lo":
+            rx += r; tx += t
+    return rx, tx, wrx, wtx
+
+
+def _sockets():
+    c = lambda ps: sum(max(0, len(_rd(p).splitlines()) - 1) for p in ps)
+    return c(("/proc/net/tcp", "/proc/net/tcp6")), c(("/proc/net/udp", "/proc/net/udp6"))
+
+
+def sample():
+    t = time.time()
+    cur, prev, cpu = _cpu_times(), _PREV["cpu"], 0.0
+    if cur and prev and cur[0] > prev[0]:
+        cpu = round(max(0.0, 100 * (1 - (cur[1] - prev[1]) / (cur[0] - prev[0]))), 1)
+    _PREV["cpu"] = cur
+    excl = {r["name"] for r in q("SELECT name FROM inbounds")}
+    n, pn, rate = _net_counters(excl), _PREV["net"], (0, 0, 0, 0)
+    if pn and t > pn[0]:
+        rate = [max(0, a - b) / (t - pn[0]) for a, b in zip(n, pn[1])]
+    _PREV["net"] = (t, n)
+    mi = _meminfo()
+    tot = mi.get("MemTotal", 0)
+    ram = round(100 * (tot - mi.get("MemAvailable", mi.get("MemFree", 0))) / tot, 1) if tot else 0
+    tcp, udp = _sockets()
+    HIST.append(dict(t=int(t), cpu=cpu, ram=ram, rx=rate[0], tx=rate[1], wrx=rate[2], wtx=rate[3], tcp=tcp, udp=udp))
+
+
+def sys_loop():
+    while True:
+        try:
+            sample()
+        except Exception:
+            log.exception("sysstat")
+        time.sleep(5)
+
+
+def _ips(excl):
+    rc, o, _ = run(["ip", "-o", "addr", "show", "scope", "global"], timeout=5)
+    out = []
+    for ln in (o or "").splitlines():
+        f = ln.split()
+        if len(f) >= 4 and f[2] in ("inet", "inet6") and f[1] not in excl:
+            out.append(dict(i=f[1], ip=f[3].split("/")[0]))
+    return out
+
+
+@app.get("/api/sys")
+@auth
+def sys_api():
+    if not HIST:
+        sample()
+    ibs = q("SELECT name FROM inbounds")
+    excl = {r["name"] for r in ibs}
+    ups = set()
+    for tl in ("wg", "awg"):
+        rc, o, _ = run([tl, "show", "interfaces"], timeout=5)
+        if rc == 0:
+            ups |= set(o.split())
+    mi, ci = _meminfo(), _rd("/proc/cpuinfo")
+    mm = re.search(r"model name\s*:\s*(.+)", ci)
+    mhz = [float(v) for v in re.findall(r"cpu MHz\s*:\s*([\d.]+)", ci)]
+    try:
+        du = shutil.disk_usage("/")
+    except Exception:
+        du = (0, 0, 0)
+    st = _rd("/proc/self/status")
+    rss, thr = re.search(r"VmRSS:\s*(\d+)", st), re.search(r"Threads:\s*(\d+)", st)
+    try:
+        la = list(os.getloadavg())
+    except Exception:
+        la = [0, 0, 0]
+    up = _rd("/proc/uptime").split()
+    rx, tx, wrx, wtx = _net_counters(excl)
+    cs = q("SELECT COUNT(*) n, COALESCE(SUM(up_bytes+down_bytes),0) u FROM clients", (), True)
+    on = q("SELECT COUNT(DISTINCT client_id) n FROM client_inbound WHERE last_hs>?", (now() - 180,), True)["n"]
+    return jsonify(
+        host=socket.gethostname(), kernel=platform.release(), cores=os.cpu_count() or 1,
+        model=mm.group(1).strip() if mm else "", mhz=round(sum(mhz) / len(mhz)) if mhz else 0,
+        mem=dict(total=mi.get("MemTotal", 0), avail=mi.get("MemAvailable", mi.get("MemFree", 0)),
+                 swap_total=mi.get("SwapTotal", 0), swap_free=mi.get("SwapFree", 0)),
+        disk=dict(total=du[0], used=du[1], free=du[2]), load=la, uptime=float(up[0]) if up else 0,
+        panel_up=time.time() - PROC_START,
+        panel=dict(rss=int(rss.group(1)) * 1024 if rss else 0, threads=int(thr.group(1)) if thr else 0),
+        net=dict(rx=rx, tx=tx, wrx=wrx, wtx=wtx), ips=_ips(excl),
+        wg=dict(up=len([r for r in ibs if r["name"] in ups]), total=len(ibs), clients=cs["n"], online=on, usage=cs["u"]),
+        hist=list(HIST))
+
+
 def state_super():
     ups = set()
     for t in ("wg", "awg"):
@@ -2076,6 +2210,20 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
 .login h1{margin:0 0 18px;font-size:20px;text-align:center}.login button.p{width:100%}
 .empty{color:var(--mut);text-align:center;padding:36px 0;background:var(--card);border:1px dashed var(--line);border-radius:14px}
 .mut{color:var(--mut)}img.qr{width:210px;max-width:100%;display:block;margin:10px auto;background:#fff;padding:10px;border-radius:12px}
+.wrap.nosta .stats{display:none}
+.sg4{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px;margin-bottom:14px}
+.sg2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,400px),1fr));gap:14px;margin-bottom:14px}
+.sg2 .card{margin:0}
+.gc{display:flex;align-items:center;gap:14px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px;min-width:0}
+.gr{width:88px;height:88px;flex:none}.gt{fill:var(--ink);font:700 21px Tahoma,sans-serif}
+.gc>div{min-width:0}.gc .gl{display:block;color:var(--mut);font-size:12.5px}.gc b{display:block;font-size:15px;direction:ltr;text-align:right}.gc small{display:block;color:var(--mut);font-size:12px;line-height:1.5}
+.ch2{position:relative;margin:8px 0}.ch2 svg{width:100%;height:150px;display:block}.ch2 .mx{position:absolute;top:0;left:2px;font-size:11px;color:var(--mut)}
+.seg{display:inline-flex;background:var(--field);border:1px solid var(--line);border-radius:9px;padding:2px}.seg button{background:none;border:0;padding:3px 12px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--mut)}.seg button.on{background:var(--acc);color:#fff}
+.pills{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0 2px}.pl{font-size:13px;padding:2px 12px;border-radius:12px;direction:ltr}.pl.a{background:rgba(56,189,248,.14);color:#7dd3fc}.pl.b2{background:rgba(167,139,250,.14);color:#c4b5fd}
+.trio{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;border-top:1px solid var(--line);padding-top:10px;margin-top:6px}.trio small{display:block;color:var(--mut);font-size:12px}.trio b{font-size:15px;direction:ltr;display:block;text-align:right}
+.split{display:flex;height:8px;border-radius:5px;overflow:hidden;background:#1b2a47;margin:8px 0}.split i{display:block;height:100%}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.kv div{background:var(--field);border:1px solid var(--line);border-radius:10px;padding:8px 12px}.kv small{display:block;color:var(--mut);font-size:12px}.kv b{font-size:15px;direction:ltr;display:block;text-align:right}
+.ipl{display:flex;flex-wrap:wrap;gap:8px}.ipl span{background:var(--field);border:1px solid var(--line);border-radius:8px;padding:2px 10px;direction:ltr;font:12.5px ui-monospace,Consolas,monospace;transition:filter .2s}.ipl.hid span{filter:blur(6px);user-select:none}
 .tl{display:flex;gap:8px;align-items:center;flex-wrap:wrap;flex:1;min-width:0}
 .srch{flex:1;min-width:150px;max-width:340px;direction:rtl;text-align:right}
 .cl{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
@@ -2129,13 +2277,13 @@ const IC={
  user:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
  admin:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.2"/><path d="M8.2 16.2c.8-1.6 2.1-2.2 3.8-2.2s3 .6 3.8 2.2"/>'};
 const ic=n=>`<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${IC[n]||''}</svg>`;
-function showLogin(){$('#app').innerHTML=`<div class="login"><div class="lg2">${ic('shield')}</div><h1>ورود به SepiPanel</h1><div class="fg"><label>نام کاربری</label><input id="lu" autocomplete="username"></div>
+function showLogin(){staStop();$('#app').innerHTML=`<div class="login"><div class="lg2">${ic('shield')}</div><h1>ورود به SepiPanel</h1><div class="fg"><label>نام کاربری</label><input id="lu" autocomplete="username"></div>
 <div class="fg"><label>رمز عبور</label><input id="lp" type="password" autocomplete="current-password"></div><button class="p" onclick="doLogin()">ورود</button></div>`;
  $('#lp').onkeydown=e=>{if(e.key==='Enter')doLogin()}}
 async function doLogin(){try{await api('/login','POST',{u:$('#lu').value,p:$('#lp').value});load()}catch(e){toast(e.message,1)}}
 async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1)}}
 const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad']};
-const NAV=[['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
+const NAV=[['sta','وضعیت','pulse','وضعیت لحظه‌ای سرور و وایرگارد: CPU، رم، دیسک، سرعت شبکه و اتصال‌ها.'],['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
 const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.']];
 const isA=()=>S&&S.role==='admin';
 function render(){
@@ -2144,12 +2292,12 @@ function render(){
  $('#app').innerHTML=`<div class="shell"><aside class="side"><div class="brand"><span class="lg">${ic('shield')}</span><div><b>SepiPanel</b><small>مدیریت WireGuard</small></div></div>
  <nav class="nav">${NV.map(([k,l,i])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${ic(i)}<span>${l}</span></button>`).join('')}<button onclick="logout()">${ic('logout')}<span>خروج</span></button></nav></aside>
  <div class="main"><header class="tb"><span class="mut sm">${isA()?'پنل ادمین':esc(S.server.wg||'wireguard-tools یافت نشد!')}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
- <div class="wrap"><h1 class="pt">${cur[1]}</h1><p class="ps">${cur[3]}</p>
+ <div class="wrap${TAB=='sta'?' nosta':''}"><h1 class="pt">${cur[1]}</h1><p class="ps">${cur[3]}</p>
  <div class="stats"><div class="st"><span class="si g">${ic('server')}</span><span class="l">اینباند فعال</span><b>${isA()?S.inbounds.length:S.inbounds.filter(i=>i.up).length+' / '+S.inbounds.length}</b></div>
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
  <div class="st"><span class="si bl">${ic('pulse')}</span><span class="l">آنلاین</span><b>${on}</b></div>
  <div class="st"><span class="si o">${ic('db')}</span><span class="l">مصرف کل</span><b>${fmtB(tot)}</b></div></div>
- ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():setHTML()}</div></div></div>`}
+ ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
 async function logout(){await api('/logout','POST');showLogin()}
 /* ---------- اینباندها ---------- */
 function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
@@ -2284,6 +2432,57 @@ function subModal(id){const c=S.clients.find(x=>x.id==id);const u=c.sub_url;
  m.querySelector('#b1').onclick=()=>copy(u);m.querySelector('#x').onclick=()=>m.remove();
  m.querySelector('#b2').onclick=async()=>{if(confirm('لینک قبلی از کار می‌افتد. ادامه؟')&&await act(()=>api('/clients/'+id+'/reset-token','POST'),'لینک جدید ساخته شد'))m.remove()};
  m.querySelector('#b3').onclick=async()=>{if(confirm('کلیدهای کلاینت عوض می‌شود و کانفیگ‌های قبلی کار نمی‌کنند. ادامه؟')&&await act(()=>api('/clients/'+id+'/regen-keys','POST'),'کلیدها عوض شد'))m.remove()}}
+/* ---------- وضعیت ---------- */
+let SY=null,SYV='srv',SHOWIP=false,STI=null;
+const dur=s=>{s=Math.floor(s||0);const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?`${d} روز و ${h} ساعت`:h?`${h} ساعت و ${m} دقیقه`:`${m} دقیقه`};
+async function staPoll(){try{SY=await api('/sys');staPaint()}catch(e){}}
+function staStart(){staStop();if(SY)staPaint();staPoll();STI=setInterval(staPoll,5000)}
+function staStop(){if(STI){clearInterval(STI);STI=null}}
+function staHTML(){return '<div id="sta"><div class="empty">در حال بارگذاری…</div></div>'}
+function lchart(k,ser,fmt,fix){const W=600,H=150,n=Math.max(2,...ser.map(s=>s.d.length)),mx=fix||Math.max(1,...ser.flatMap(s=>s.d))*1.12;
+ const X=(i,len)=>((n-len+i)*W/(n-1)).toFixed(1),Y=v=>(H-3-(Math.min(v,mx)/mx)*(H-8)).toFixed(1);
+ const defs=ser.map((s,i)=>`<linearGradient id="${k}${i}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${s.c}" stop-opacity=".32"/><stop offset="1" stop-color="${s.c}" stop-opacity="0"/></linearGradient>`).join('');
+ const grid=[.25,.5,.75].map(f=>`<line x1="0" x2="${W}" y1="${(H*f).toFixed(1)}" y2="${(H*f).toFixed(1)}" stroke="#223356" stroke-dasharray="3 5" vector-effect="non-scaling-stroke"/>`).join('');
+ const body=ser.map((s,i)=>{if(s.d.length<2)return '';const pts=s.d.map((v,j)=>X(j,s.d.length)+','+Y(v)).join(' L');
+  return `<path d="M${pts} L${W},${H} L${X(0,s.d.length)},${H}Z" fill="url(#${k}${i})"/><path d="M${pts}" fill="none" stroke="${s.c}" stroke-width="2" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`}).join('');
+ return `<div class="ch2" dir="ltr"><span class="mx">${fmt(mx)}</span><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs>${defs}</defs>${grid}${body}</svg></div>`}
+function gauge(label,pct,main,sub){const r=38,C=2*Math.PI*r,col=pct>=90?'var(--bad)':pct>=70?'var(--warn)':'var(--ok)';
+ return `<div class="gc"><svg viewBox="0 0 100 100" class="gr"><circle cx="50" cy="50" r="${r}" fill="none" stroke="#1b2a47" stroke-width="9"/><circle cx="50" cy="50" r="${r}" fill="none" stroke="${col}" stroke-width="9" stroke-linecap="round" stroke-dasharray="${(C*pct/100).toFixed(1)} ${C.toFixed(1)}" transform="rotate(-90 50 50)"/><text x="50" y="56" text-anchor="middle" class="gt">${Math.round(pct)}%</text></svg>
+ <div><span class="gl">${label}</span><b>${main}</b><small>${sub}</small></div></div>`}
+function staPaint(){const e=$('#sta'),y=SY;if(!e||!y)return;
+ const h=y.hist||[],ls=h[h.length-1]||{cpu:0,ram:0,rx:0,tx:0,wrx:0,wtx:0,tcp:0,udp:0},col=k=>h.map(x=>x[k]);
+ const m=y.mem,mu=m.total-m.avail,sw=m.swap_total-m.swap_free,pc=(a,b)=>b?Math.min(100,a*100/b):0;
+ const span=h.length>1?Math.max(1,Math.round((h[h.length-1].t-h[0].t)/60)):0,wg=SYV==='wg';
+ const U=wg?'wrx':'tx',D=wg?'wtx':'rx',lu=wg?'آپلود کاربران':'ارسال',ld=wg?'دانلود کاربران':'دریافت';
+ const tot=wg?[y.net.wrx,y.net.wtx]:[y.net.tx,y.net.rx],pk=Math.max(0,...h.map(x=>x[U]+x[D]));
+ const sp=v=>fmtB(v)+'/s',tt=ls.tcp+ls.udp;
+ e.innerHTML=`<div class="sg4">
+ ${gauge('پردازنده',ls.cpu,'Load '+y.load.map(v=>v.toFixed(2)).join(' · '),`${y.cores} هسته${y.mhz?' · '+(y.mhz/1000).toFixed(2)+' GHz':''}`)}
+ ${gauge('حافظه (RAM)',pc(mu,m.total),fmtB(mu),'از '+fmtB(m.total))}
+ ${gauge('Swap',pc(sw,m.swap_total),m.swap_total?fmtB(sw):'—',m.swap_total?'از '+fmtB(m.swap_total):'فعال نیست')}
+ ${gauge('دیسک',pc(y.disk.used,y.disk.total),fmtB(y.disk.used),`آزاد ${fmtB(y.disk.free)} از ${fmtB(y.disk.total)}`)}</div>
+ <div class="card"><div class="row"><div class="ch" style="margin:0">${ic('pulse')}ترافیک و سرعت شبکه</div>
+  <div class="seg"><button class="${wg?'':'on'}" onclick="SYV='srv';staPaint()">کل سرور</button><button class="${wg?'on':''}" onclick="SYV='wg';staPaint()">وایرگارد</button></div></div>
+  <div class="pills"><span class="pl a">↓ ${ld}: ${sp(ls[D])}</span><span class="pl b2">↑ ${lu}: ${sp(ls[U])}</span></div>
+  ${lchart('tr',[{d:col(D),c:'#38bdf8'},{d:col(U),c:'#a78bfa'}],sp)}
+  <div class="trio"><div><small>${lu} (مجموع)</small><b>${fmtB(tot[0])}</b></div><div><small>${ld} (مجموع)</small><b>${fmtB(tot[1])}</b></div><div><small>اوج در ${span} دقیقه اخیر</small><b>${sp(pk)}</b></div></div></div>
+ <div class="sg2" style="margin-top:14px"><div class="card"><div class="ch">${ic('server')}تاریخچه CPU و RAM <span class="mut sm">(${span} دقیقه اخیر)</span></div>
+  <div class="pills"><span class="pl" style="background:rgba(245,158,11,.14);color:#fbbf24">CPU ${ls.cpu.toFixed(1)}%</span><span class="pl" style="background:rgba(34,197,94,.14);color:#4ade80">RAM ${ls.ram.toFixed(1)}%</span></div>
+  ${lchart('hs',[{d:col('cpu'),c:'#f59e0b'},{d:col('ram'),c:'#22c55e'}],v=>Math.round(v)+'%',100)}</div>
+ <div class="card"><div class="ch">${ic('globe')}اتصال‌های باز</div><div style="font-size:26px;font-weight:700;line-height:1.3">${tt} <small class="mut" style="font-size:13px;font-weight:400">سوکت</small></div>
+  <div class="split"><i style="width:${tt?ls.tcp*100/tt:0}%;background:#60a5fa"></i><i style="width:${tt?ls.udp*100/tt:0}%;background:#f472b6"></i></div>
+  <div class="pills" style="margin-top:0"><span class="pl" style="background:rgba(96,165,250,.14);color:#93c5fd">TCP ${ls.tcp}</span><span class="pl" style="background:rgba(244,114,182,.14);color:#f9a8d4">UDP ${ls.udp}</span></div>
+  ${lchart('sk',[{d:h.map(x=>x.tcp+x.udp),c:'#60a5fa'}],v=>Math.round(v))}</div></div>
+ <div class="sg2"><div class="card"><div class="ch">${ic('shield')}وایرگارد</div><div class="kv">
+  <div><small>اینباند فعال</small><b>${y.wg.up} / ${y.wg.total}</b></div><div><small>کلاینت‌ها</small><b>${y.wg.clients}</b></div>
+  <div><small>آنلاین</small><b>${y.wg.online}</b></div><div><small>مصرف کل کلاینت‌ها</small><b>${fmtB(y.wg.usage)}</b></div></div></div>
+ <div class="card"><div class="ch">${ic('info')}سرور و پنل</div><div class="kv">
+  <div><small>روشن بودن سرور</small><b style="direction:rtl">${dur(y.uptime)}</b></div><div><small>اجرای پنل</small><b style="direction:rtl">${dur(y.panel_up)}</b></div>
+  <div><small>RAM پنل</small><b>${fmtB(y.panel.rss)}</b></div><div><small>Thread پنل</small><b>${y.panel.threads}</b></div>
+  <div><small>هاست</small><b>${esc(y.host)}</b></div><div><small>کرنل</small><b>${esc(y.kernel)}</b></div></div>
+  ${y.model?`<div class="mut sm" style="direction:ltr;text-align:left;margin-top:8px">${esc(y.model)}</div>`:''}</div></div>
+ <div class="card"><div class="row"><div class="ch" style="margin:0">${ic('globe')}آدرس‌های سرور</div><button class="s" onclick="SHOWIP=!SHOWIP;staPaint()">${SHOWIP?'مخفی کردن':'نمایش'}</button></div>
+  <div class="ipl ${SHOWIP?'':'hid'}" style="margin-top:12px">${y.ips.map(a=>`<span>${esc(a.ip)} <small class="mut">${esc(a.i)}</small></span>`).join('')||'<span class="mut">—</span>'}</div></div>`}
 /* ---------- ادمین‌ها ---------- */
 function admHTML(){return `<div class="bar2"><span></span><button class="p" onclick="admModal(null)">+ ادمین جدید</button></div>`+
  (S.admins.map(a=>{const pct=a.limit_bytes?Math.min(100,a.used_bytes*100/a.limit_bytes):0,st=STL[a.state]||[a.state,''];
@@ -2352,7 +2551,7 @@ function savePanel(){act(()=>api('/panel','PUT',{domain:$('#p_dom').value,port:$
 async function restartPanel(){if(!confirm('پنل ری‌استارت می‌شود و به آدرس جدید می‌روید. ادامه؟'))return;try{const r=await api('/panel/restart','POST');toast('در حال ری‌استارت…');setTimeout(()=>{location.href=r.url},3500)}catch(e){toast(e.message,1)}}
 function issueCert(){toast('در حال گرفتن گواهی… (تا ۲ دقیقه)');act(()=>api('/panel/cert','POST',{domain:$('#p_dom').value,email:$('#p_mail').value}),'گواهی ساخته شد؛ پنل را ری‌استارت کنید')}
 async function saveAcct(){try{await api('/panel/account','POST',{current:$('#a_cur').value,user:$('#a_user').value,password:$('#a_new').value});toast('ذخیره شد');$('#a_cur').value='';$('#a_new').value='';await load()}catch(e){toast(e.message,1)}}
-load();setInterval(()=>{if(S&&TAB!=='set'&&!document.querySelector('.ov')&&document.activeElement!==$('#cq'))load()},20000);
+load();setInterval(()=>{if(S&&TAB!=='set'&&!document.querySelector('.ov')&&TAB!=='sta'&&document.activeElement!==$('#cq'))load()},20000);
 </script></body></html>"""
 
 
@@ -2473,6 +2672,7 @@ def main():
     app.config["SESSION_COOKIE_SECURE"] = bool(tls)
     threading.Thread(target=reconcile, daemon=True).start()
     threading.Thread(target=stats_loop, daemon=True).start()
+    threading.Thread(target=sys_loop, daemon=True).start()
     log.info("SepiPanel روی %s://%s:%s/%s", "https" if tls else "http", PANEL_HOST, c["port"], c["path"])
     app.run(host=PANEL_HOST, port=c["port"], threaded=True, ssl_context=tls)
 
