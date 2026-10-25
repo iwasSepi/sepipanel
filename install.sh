@@ -32,11 +32,12 @@ export DEBIAN_FRONTEND=noninteractive
 
 echo ">> نصب پیش‌نیازها..."
 apt-get update -y
-apt-get install -y wireguard wireguard-tools iptables iproute2 python3 python3-pip python3-flask python3-qrcode curl ca-certificates certbot
+apt-get install -y wireguard wireguard-tools iptables iproute2 python3 python3-pip python3-flask python3-qrcode python3-paramiko curl ca-certificates certbot
 
 # اگر نسخه‌های apt موجود نبود، با pip نصب شود
 python3 -c "import flask" 2>/dev/null || pip3 install flask --break-system-packages
 python3 -c "import qrcode" 2>/dev/null || pip3 install qrcode --break-system-packages || true
+python3 -c "import paramiko" 2>/dev/null || apt-get install -y python3-paramiko || pip3 install paramiko --break-system-packages || true   # برای ساخت تانل BackPack با SSH
 
 if [ "${AWG:-0}" = "1" ]; then
   echo ">> نصب AmneziaWG..."
