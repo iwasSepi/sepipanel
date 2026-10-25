@@ -17,7 +17,7 @@ SepiPanel — پنل مدیریت WireGuard (تک‌فایل)
     add-apt-repository -y ppa:amnezia/ppa && apt install -y amneziawg amneziawg-tools
 پورت/دامنه/HTTPS/مسیر مخفی/رمز را از تب «تنظیمات» عوض کنید. اگر قفل شدید:  python3 sepipanel.py --reset
 """
-import uuid, urllib.request, zipfile, tempfile, string, os, re, io, sys, json, time, html, base64, secrets, sqlite3, hmac, hashlib, shutil, socket, ssl, ipaddress, subprocess, threading, logging, collections, platform
+import uuid, urllib.request, zipfile, tempfile, string, os, re, io, sys, json, time, html, base64, secrets, sqlite3, hmac, hashlib, shutil, socket, ssl, ipaddress, subprocess, threading, logging, collections, platform, shlex
 from urllib.parse import quote, urlsplit
 from functools import wraps
 
@@ -129,6 +129,9 @@ CREATE TABLE IF NOT EXISTS admins(
   limit_bytes INTEGER DEFAULT 0, used_bytes INTEGER DEFAULT 0, expiry INTEGER DEFAULT 0,
   ver TEXT DEFAULT '', created INTEGER, last_login INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS nodes(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, address TEXT NOT NULL, ssh_port INTEGER DEFAULT 22,
+  ssh_user TEXT DEFAULT 'root', xray_bin TEXT DEFAULT '/usr/local/bin/xray', xray_ver TEXT DEFAULT '', note TEXT DEFAULT '', created INTEGER);
 """)
 
 
@@ -141,7 +144,8 @@ def ensure_cols(table, cols):
 
 ensure_cols("inbounds", {"obf": "TEXT DEFAULT ''", "exclude_sub": "INTEGER DEFAULT 0",
                          "proto": "TEXT DEFAULT 'wg'", "psk": "TEXT DEFAULT ''",
-                         "ovpn": "TEXT DEFAULT ''", "pki": "TEXT DEFAULT ''", "xcfg": "TEXT DEFAULT ''"})
+                         "ovpn": "TEXT DEFAULT ''", "pki": "TEXT DEFAULT ''", "xcfg": "TEXT DEFAULT ''",
+                         "node_id": "INTEGER DEFAULT 0"})
 ensure_cols("client_inbound", {"l2tp_user": "TEXT DEFAULT ''", "l2tp_pass": "TEXT DEFAULT ''",
                                "ovpn_cn": "TEXT DEFAULT ''", "ovpn_crt": "TEXT DEFAULT ''", "ovpn_key": "TEXT DEFAULT ''",
                                "vuuid": "TEXT DEFAULT ''"})
@@ -269,6 +273,14 @@ def is_ovpn(ib):
         return ib["proto"] == "ovpn"
     except (KeyError, IndexError):
         return False
+
+
+def ib_node(ib):
+    """id نودی که اینباند روی آن است؛ ۰ = همین سرور (پنل)"""
+    try:
+        return int(ib["node_id"] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return 0
 
 
 def rand_secret(n=12):
@@ -407,7 +419,7 @@ def parse_obf(d):
 IB_COLS = ["name", "remark", "port", "private_key", "public_key", "address4", "address6", "endpoint",
            "endpoint_port", "dns", "mtu", "table_", "fwmark", "pre_up", "post_up", "pre_down", "post_down",
            "auto_rules", "nat_iface", "use_psk", "client_allowed_ips", "client_keepalive", "client_mtu", "obf", "exclude_sub",
-           "proto", "psk", "ovpn", "pki", "xcfg"]
+           "proto", "psk", "ovpn", "pki", "xcfg", "node_id"]
 
 
 def inbound_defaults():
@@ -523,7 +535,7 @@ def parse_ovpn(d, cur=None):
     port = num(d.get("port"), 0, 1, 65535, "پورت")
     if not port:
         raise Err("پورت لازم است")
-    if q("SELECT 1 FROM inbounds WHERE port=? AND id!=?", (port, cid), True):
+    if q("SELECT 1 FROM inbounds WHERE port=? AND id!=? AND COALESCE(node_id,0)=0", (port, cid), True):
         raise Err("این پورت برای اینباند دیگری استفاده شده")
     if port in (500, 4500, 1701) and q("SELECT 1 FROM inbounds WHERE proto='l2tp'", (), True):
         raise Err("پورت‌های 500، 4500 و 1701 برای L2TP رزرو است")
@@ -608,7 +620,25 @@ def parse_l2tp(d, cur=None):
                 client_allowed_ips="0.0.0.0/0, ::/0", client_keepalive=0, client_mtu=0)
 
 
+def _ib_node(d, cur=None):
+    """نود اینباند: در ساخت از فرم می‌آید، بعد از ساخت قابل تغییر نیست"""
+    if cur is not None:
+        return ib_node(cur)
+    nid = num(d.get("node_id"), 0, 0, None, "نود")
+    if nid and not q("SELECT 1 FROM nodes WHERE id=?", (nid,), True):
+        raise Err("نود انتخاب‌شده پیدا نشد")
+    return nid
+
+
 def parse_inbound(d, cur=None):
+    proto = cur["proto"] if cur else str(d.get("proto") or "wg")
+    nid = _ib_node(d, cur) if proto == "vless" else 0        # نود فقط برای VLESS (Xray) معنی دارد
+    o = _parse_inbound_core(d, cur)
+    o["node_id"] = nid
+    return o
+
+
+def _parse_inbound_core(d, cur=None):
     proto = cur["proto"] if cur else str(d.get("proto") or "wg")
     if proto not in ("wg", "l2tp", "ovpn", "vless"):
         raise Err("پروتکل نامعتبر است")
@@ -627,7 +657,7 @@ def parse_inbound(d, cur=None):
     port = num(d.get("port"), 0, 1, 65535, "پورت")
     if not port:
         raise Err("پورت لازم است")
-    if q("SELECT 1 FROM inbounds WHERE port=? AND id!=?", (port, cid), True):
+    if q("SELECT 1 FROM inbounds WHERE port=? AND id!=? AND COALESCE(node_id,0)=0", (port, cid), True):
         raise Err("این پورت برای اینباند دیگری استفاده شده")
     try:
         a4 = ipaddress.ip_interface(str(d.get("address4", "")).strip())
@@ -788,6 +818,9 @@ def server_conf(ib, mask=False):
 
 def ep_host(ib):
     h = ib["endpoint"]
+    if not h and ib_node(ib):
+        n = q("SELECT address FROM nodes WHERE id=?", (ib_node(ib),), True)
+        h = n["address"] if n else ""
     if not h:
         try:
             h = urlsplit("//" + request.host).hostname or "SERVER_IP"
@@ -980,9 +1013,8 @@ def ensure_xray():
     return "" if xray_bin() else "نصب Xray-core ناموفق بود"
 
 
-def ensure_xray_unit():
-    b = xray_bin() or XRAY_BIN
-    write_file(XRAY_UNIT, f"""[Unit]
+def xray_unit_text(b):
+    return f"""[Unit]
 Description=SepiPanel Xray (%i)
 After=network-online.target
 Wants=network-online.target
@@ -995,7 +1027,12 @@ LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-""", 0o644, backup=False)
+"""
+
+
+def ensure_xray_unit():
+    b = xray_bin() or XRAY_BIN
+    write_file(XRAY_UNIT, xray_unit_text(b), 0o644, backup=False)
     run(["systemctl", "daemon-reload"], timeout=20)
 
 
@@ -1008,6 +1045,8 @@ def xray_unit(ib):
 
 
 def xray_up(ib):
+    if ib_node(ib):
+        return node_up(ib)           # وضعیت نود از آخرین بررسی SSH (در NODE_STATE) خوانده می‌شود
     return run(["systemctl", "is-active", "--quiet", xray_unit(ib)], timeout=8)[0] == 0
 
 
@@ -1049,6 +1088,7 @@ def _is_ip(h):
 
 def parse_vless(d, cur=None):
     cid = cur["id"] if cur else 0
+    nid = _ib_node(d, cur)
     name = str(d.get("name", "")).strip()
     if not re.fullmatch(r"[A-Za-z0-9_=+.\-]{1,15}", name):
         raise Err("نام اینباند باید ۱ تا ۱۵ حرف انگلیسی/عدد/_ - . باشد")
@@ -1077,13 +1117,13 @@ def parse_vless(d, cur=None):
         raise Err("Reality فقط با TCP، gRPC یا xHTTP کار می‌کند")
     # تداخل پورت
     pp = num(setting("panel_port"), PANEL_PORT, 1, 65535, "پورت پنل")
-    if net == "tcp" and port == pp:
+    if net == "tcp" and port == pp and not nid:
         raise Err("این پورت را خود پنل استفاده می‌کند")
-    for r in q("SELECT * FROM inbounds WHERE id!=? AND port=?", (cid, port)):
+    for r in q("SELECT * FROM inbounds WHERE id!=? AND port=? AND COALESCE(node_id,0)=?", (cid, port, nid)):
         rnet = "udp" if r["proto"] in ("wg", "l2tp") else (ovpn_of(r)["transport"] if r["proto"] == "ovpn" else xray_net(r))
         if rnet == net:
             raise Err(f"پورت {port}/{net} برای اینباند «{r['name']}» استفاده شده")
-    if net == "udp" and port in (500, 4500, 1701) and q("SELECT 1 FROM inbounds WHERE proto='l2tp'", (), True):
+    if not nid and net == "udp" and port in (500, 4500, 1701) and q("SELECT 1 FROM inbounds WHERE proto='l2tp'", (), True):
         raise Err("پورت‌های 500، 4500 و 1701 برای L2TP رزرو است")
     lst = strv("listen") or "0.0.0.0"
     try:
@@ -1147,7 +1187,7 @@ def parse_vless(d, cur=None):
         elif o["tls_mode"] == "files":
             o["tls_cert"], o["tls_key"] = strv("tls_cert"), strv("tls_key")
             for p_ in (o["tls_cert"], o["tls_key"]):
-                if not p_.startswith("/") or not os.path.isfile(p_):
+                if not p_.startswith("/") or (not nid and not os.path.isfile(p_)):      # روی نود، مسیر فایل مالِ خود نود است
                     raise Err(f"فایل گواهی روی سرور پیدا نشد: {p_ or '(خالی)'}")
         else:
             cn = o["sni"] or (cur["endpoint"] if cur and cur["endpoint"] else "") or "localhost"
@@ -1262,6 +1302,9 @@ def xray_build(ib):
             ts["serverName"] = o["sni"]
         if o["tls_mode"] == "self":
             ts["certificates"] = [{"certificate": pki["tls_crt"].strip().splitlines(), "key": pki["tls_key"].strip().splitlines()}]
+        elif ib_node(ib) and o["tls_mode"] == "panel":      # روی نود فایل گواهی پنل وجود ندارد؛ محتوا داخل کانفیگ می‌رود
+            ts["certificates"] = [{"certificate": (_read(setting("tls_cert")) or "").strip().splitlines(),
+                                   "key": (_read(setting("tls_key")) or "").strip().splitlines()}]
         else:
             cf, kf = (setting("tls_cert"), setting("tls_key")) if o["tls_mode"] == "panel" else (o["tls_cert"], o["tls_key"])
             ts["certificates"] = [{"certificateFile": cf, "keyFile": kf}]
@@ -1330,6 +1373,8 @@ def xray_fw(ib, add):
 
 
 def apply_vless(ib, restart=False):
+    if ib_node(ib):
+        return apply_vless_remote(ib, restart)
     name = ib["name"]
     if not ib["enabled"]:
         teardown(ib)
@@ -1388,6 +1433,8 @@ def apply_vless(ib, restart=False):
 
 
 def vless_teardown(ib):
+    if ib_node(ib):
+        return vless_teardown_remote(ib)
     try:
         xray_fw(ib, False)
     except Exception:
@@ -1399,8 +1446,26 @@ def vless_teardown(ib):
         pass
 
 
+def _vless_ingest(ib, out):
+    """خروجی «xray api statsquery» یک اینباند را به مصرف کلاینت‌ها اضافه می‌کند (هم لوکال، هم نود)"""
+    try:
+        stats = json.loads(out).get("stat") or []
+    except Exception:
+        return
+    per = {}
+    for s_ in stats:
+        m = re.fullmatch(r"user>>>(\d+)-(\d+)@sp>>>traffic>>>(uplink|downlink)", s_.get("name", ""))
+        if m and int(m.group(2)) == ib["id"]:
+            per.setdefault(int(m.group(1)), [0, 0])[0 if m.group(3) == "uplink" else 1] += int(s_.get("value") or 0)
+    for cid_, (up_, dn_) in per.items():
+        if up_ or dn_:
+            x("UPDATE clients SET up_bytes=up_bytes+?, down_bytes=down_bytes+?, last_seen=? WHERE id=?", (up_, dn_, now(), cid_))
+            x("UPDATE client_inbound SET last_hs=? WHERE client_id=? AND inbound_id=?", (now(), cid_, ib["id"]))
+            x("UPDATE admins SET used_bytes=used_bytes+? WHERE id=(SELECT owner_id FROM clients WHERE id=?)", (up_ + dn_, cid_))
+
+
 def collect_vless_stats():
-    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='vless'"):
+    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='vless' AND COALESCE(node_id,0)=0"):
         if not xray_bin() or not xray_up(ib):
             continue
         try:
@@ -1411,20 +1476,7 @@ def collect_vless_stats():
         rc, out, _ = run([xray_bin(), "api", "statsquery", f"-s=127.0.0.1:{aport}", "-pattern", "user>>>", "-reset=true"], timeout=15)
         if rc != 0:
             continue
-        try:
-            stats = json.loads(out).get("stat") or []
-        except Exception:
-            continue
-        per = {}
-        for s_ in stats:
-            m = re.fullmatch(r"user>>>(\d+)-(\d+)@sp>>>traffic>>>(uplink|downlink)", s_.get("name", ""))
-            if m and int(m.group(2)) == ib["id"]:
-                per.setdefault(int(m.group(1)), [0, 0])[0 if m.group(3) == "uplink" else 1] += int(s_.get("value") or 0)
-        for cid_, (up_, dn_) in per.items():
-            if up_ or dn_:
-                x("UPDATE clients SET up_bytes=up_bytes+?, down_bytes=down_bytes+?, last_seen=? WHERE id=?", (up_, dn_, now(), cid_))
-                x("UPDATE client_inbound SET last_hs=? WHERE client_id=? AND inbound_id=?", (now(), cid_, ib["id"]))
-                x("UPDATE admins SET used_bytes=used_bytes+? WHERE id=(SELECT owner_id FROM clients WHERE id=?)", (up_ + dn_, cid_))
+        _vless_ingest(ib, out)
 
 
 def vless_link(c, ci, ib):
@@ -2232,7 +2284,7 @@ def stats_loop():
 
 
 def reconcile():
-    for ib in q("SELECT id FROM inbounds"):
+    for ib in q("SELECT id FROM inbounds WHERE COALESCE(node_id,0)=0"):
         w = apply_inbound(ib["id"])
         if w:
             log.warning(w)
@@ -2699,7 +2751,7 @@ class _Local:
 class _Remote:
     label = "سرور مقابل"
 
-    def __init__(self, host, port, user, pw):
+    def __init__(self, host, port, user, pw, key=None):
         try:
             import paramiko
         except ImportError:
@@ -2711,8 +2763,9 @@ class _Remote:
         self.c = paramiko.SSHClient()
         self.c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            self.c.connect(host, port=port, username=user, password=pw, timeout=15, banner_timeout=20,
-                           auth_timeout=20, look_for_keys=False, allow_agent=False)
+            kw = dict(pkey=_pkey(key)) if key else dict(password=pw)
+            self.c.connect(host, port=port, username=user, timeout=15, banner_timeout=20,
+                           auth_timeout=20, look_for_keys=False, allow_agent=False, **kw)
         except paramiko.AuthenticationException:
             raise Err("نام کاربری یا رمز SSH اشتباه است")
         except Exception as e:
@@ -3064,6 +3117,508 @@ def tun_delete(name):
     return jsonify(ok=True, warn=warn)
 
 
+# ------------------------------ نودها (Xray روی سرورهای دیگر) ------------------------------
+# نود = یک سرور جدا که پنل با SSH به آن وصل می‌شود و اینباندهای VLESS را روی آن اجرا می‌کند.
+# رمز SSH فقط یک‌بار (هنگام افزودن) برای نصب کلید پنل روی نود استفاده می‌شود و ذخیره نمی‌شود؛
+# بعد از آن، پنل با همان کلید به نود وصل می‌شود. خود پنل هم «نود اصلی» حساب می‌شود (node_id=0).
+NODE_JOBS = collections.OrderedDict()
+NODE_STATE = {}            # id نود → dict(ok, ts, err, up={نام اینباند: bool}, ver)
+NODE_DIRTY = set()         # اینباندهایی که اعمالشان روی نود نشد؛ بعد از وصل شدن نود دوباره امتحان می‌شود
+_NODE_CONN, _NODE_LK, _NODE_G = {}, {}, threading.Lock()
+
+XRAY_NODE_INSTALL = r"""
+set -e
+XB=$(command -v xray 2>/dev/null || true)
+if [ -z "$XB" ] && [ -x /usr/local/bin/xray ]; then XB=/usr/local/bin/xray; fi
+if [ -n "$XB" ]; then echo "BIN=$XB"; "$XB" version | head -1; exit 0; fi
+case "$(uname -m)" in x86_64|amd64) A=64;; aarch64|arm64) A=arm64-v8a;; armv7l) A=arm32-v7a;; i686|i386) A=32;; s390x) A=s390x;; *) echo "معماری پشتیبانی نمی‌شود: $(uname -m)"; exit 3;; esac
+command -v curl >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq curl ca-certificates >/dev/null 2>&1 || true; }
+T=$(mktemp -d); cd "$T"
+curl -fsSL --retry 2 --connect-timeout 10 --max-time 240 -o x.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$A.zip" || { echo "دانلود از GitHub ناموفق بود"; exit 4; }
+if command -v unzip >/dev/null 2>&1; then unzip -o -q x.zip xray; else python3 -c "import zipfile; zipfile.ZipFile('x.zip').extract('xray')"; fi
+install -m 0755 xray /usr/local/bin/xray
+cd /; rm -rf "$T"
+echo "BIN=/usr/local/bin/xray"; /usr/local/bin/xray version | head -1
+"""
+
+
+def _paramiko():
+    try:
+        import paramiko
+    except ImportError:
+        run(["apt-get", "install", "-y", "python3-paramiko"], timeout=240)
+        try:
+            import paramiko
+        except ImportError:
+            raise Err("کتابخانه paramiko نصب نیست؛ روی سرور بزنید: apt install python3-paramiko")
+    return paramiko
+
+
+def _pkey(pem):
+    p = _paramiko()
+    for cls in (p.ECDSAKey, p.RSAKey, p.Ed25519Key):
+        try:
+            return cls.from_private_key(io.StringIO(pem))
+        except Exception:
+            continue
+    raise Err("کلید SSH پنل خوانده نشد")
+
+
+def node_key():
+    """کلید SSH مخصوص پنل (یک‌بار ساخته می‌شود)؛ کلید عمومی‌اش روی هر نود نصب می‌شود"""
+    k = setting("node_ssh_key")
+    if k:
+        return k
+    p = _paramiko()
+    try:
+        key = p.ECDSAKey.generate()
+    except Exception:
+        key = p.RSAKey.generate(3072)
+    buf = io.StringIO()
+    key.write_private_key(buf)
+    set_setting("node_ssh_key", buf.getvalue())
+    return buf.getvalue()
+
+
+def node_pub():
+    k = _pkey(node_key())
+    return f"{k.get_name()} {k.get_base64()} sepipanel"
+
+
+def _node_lock(nid):
+    with _NODE_G:
+        return _NODE_LK.setdefault(nid, threading.RLock())
+
+
+def node_drop(nid):
+    c = _NODE_CONN.pop(nid, None)
+    if c is not None:
+        c.close()
+
+
+def node_sess(n):
+    nid = n["id"]
+    c = _NODE_CONN.get(nid)
+    if c is not None:
+        try:
+            tr = c.c.get_transport()
+            if tr is not None and tr.is_active():
+                return c
+        except Exception:
+            pass
+        node_drop(nid)
+    c = _Remote(n["address"], n["ssh_port"], n["ssh_user"], None, key=node_key())
+    _NODE_CONN[nid] = c
+    return c
+
+
+def node_call(n, fn):
+    """fn(sess) را روی اتصال کش‌شدهٔ نود اجرا می‌کند؛ اگر اتصال افتاده بود یک‌بار دوباره وصل می‌شود"""
+    with _node_lock(n["id"]):
+        last = None
+        for _ in range(2):
+            s = node_sess(n)             # اتصال/احراز هویت ناموفق → Err
+            try:
+                return fn(s)
+            except (socket.timeout, TimeoutError):
+                node_drop(n["id"])
+                raise Err(f"نود «{n['name']}» جواب نداد (timeout)")
+            except Err:
+                raise
+            except Exception as e:
+                last = e
+                node_drop(n["id"])
+                log.warning("node %s: %s", n["name"], e)
+        raise Err(f"ارتباط با نود «{n['name']}» قطع شد: {str(last)[:150]}")
+
+
+def node_up(ib):
+    st = NODE_STATE.get(ib_node(ib)) or {}
+    return bool((st.get("up") or {}).get(ib["name"]))
+
+
+def node_fw_script(ib, add):
+    net, port = xray_net(ib), int(ib["port"])
+    ufw = "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'"
+    if add:
+        return (f"command -v iptables >/dev/null 2>&1 && ! iptables -C INPUT -p {net} --dport {port} -j ACCEPT 2>/dev/null "
+                f"&& iptables -I INPUT -p {net} --dport {port} -j ACCEPT; {ufw} && ufw allow {port}/{net} >/dev/null 2>&1; true")
+    return (f"command -v iptables >/dev/null 2>&1 && while iptables -C INPUT -p {net} --dport {port} -j ACCEPT 2>/dev/null; "
+            f"do iptables -D INPUT -p {net} --dport {port} -j ACCEPT; done; {ufw} && ufw delete allow {port}/{net} >/dev/null 2>&1; true")
+
+
+def apply_vless_remote(ib, restart=False):
+    """همان کار apply_vless ولی روی نود (از طریق SSH). برمی‌گرداند: رشته‌ی خطا یا ''"""
+    name, nid = ib["name"], ib_node(ib)
+    n = q("SELECT * FROM nodes WHERE id=?", (nid,), True)
+    if not n:
+        return f"{name}: نودِ این اینباند پیدا نشد"
+    if not ib["enabled"]:
+        vless_teardown_remote(ib)
+        return ""
+    try:
+        cfg = xray_build(ib)
+    except Exception as ex:
+        return f"{name}: کانفیگ Xray ساخته نشد — {ex}"
+    path, unit, xb = xray_path(ib), xray_unit(ib), n["xray_bin"] or XRAY_BIN
+    new_path, add_path = path[:-5] + ".new.json", path[:-5] + ".add.json"      # پسوند .json لازم است تا Xray فرمت را بشناسد
+    qp, qn, qa, qu, qx = (shlex.quote(v) for v in (path, new_path, add_path, unit, xb))
+    text = json.dumps(cfg, indent=2, ensure_ascii=False)
+    aport = cfg["inbounds"][0]["port"]
+    new_users = cfg["inbounds"][1]["settings"]["clients"]
+
+    def job(s):
+        rc, o, _ = s.run(f"cat {qp} 2>/dev/null; echo '@@UP'; systemctl is-active --quiet {qu} && echo 1 || echo 0; "
+                         f"echo '@@UNIT'; test -f {shlex.quote(XRAY_UNIT)} && echo 1 || echo 0")
+        old_txt, _, tail = o.partition("@@UP")
+        up_txt, _, unit_txt = tail.partition("@@UNIT")
+        up, has_unit = up_txt.strip() == "1", unit_txt.strip() == "1"
+        try:
+            old = json.loads(old_txt) if old_txt.strip() else None
+        except Exception:
+            old = None
+        s.put(new_path, text, 0o600)
+        rc, o, e = s.run(f"{qx} run -test -c {qn}", timeout=40)
+        if rc != 0:
+            s.run(f"rm -f {qn}")
+            return f"{name}: کانفیگ Xray روی نود معتبر نیست — {(e or o).strip()[-300:]}"
+        s.run(f"mv -f {qn} {qp}")
+        if not has_unit:
+            s.put(XRAY_UNIT, xray_unit_text(xb), 0o644)
+            s.run("systemctl daemon-reload")
+        if ib["auto_rules"]:
+            s.run(node_fw_script(ib, True))
+        need = restart or not up or old is None or xray_shape(old) != xray_shape(cfg)
+        if not need:
+            old_ids = {u["id"] for i in old["inbounds"] if i.get("protocol") == "vless" for u in i["settings"]["clients"]}
+            new_ids = {u["id"] for u in new_users}
+            if old_ids - new_ids:
+                need = True          # حذف کاربر → ری‌استارت تا اتصال‌های بازِ او قطع شود
+            elif new_ids - old_ids:
+                add = {"inbounds": [{"tag": cfg["inbounds"][1]["tag"], "protocol": "vless", "port": ib["port"],
+                                     "listen": cfg["inbounds"][1]["listen"],
+                                     "settings": {"clients": [u for u in new_users if u["id"] not in old_ids], "decryption": "none"}}]}
+                s.put(add_path, json.dumps(add), 0o600)
+                rc, _, _ = s.run(f"{qx} api adu -s=127.0.0.1:{aport} {qa}; r=$?; rm -f {qa}; exit $r", timeout=20)
+                need = rc != 0
+        if need:
+            rc, o, e = s.run(f"systemctl enable {qu} >/dev/null 2>&1; systemctl restart {qu} || exit 1; sleep 1; "
+                             f"systemctl is-active --quiet {qu} || exit 2", timeout=60)
+            if rc == 1:
+                return f"{name}: راه‌اندازی Xray روی نود ناموفق بود — {(e or o).strip()[-250:]} (journalctl -u {unit} -e)"
+            if rc == 2:
+                return f"{name}: Xray روی نود بعد از اجرا متوقف شد (پورت {ib['port']} اشغال است؟) — journalctl -u {unit} -e"
+        return ""
+
+    try:
+        w = node_call(n, job)
+    except Err as e:
+        NODE_DIRTY.add(ib["id"])
+        NODE_STATE[nid] = dict(NODE_STATE.get(nid) or {}, ok=False, ts=now(), err=str(e)[:200], up={})
+        return f"{name}: {e} — بعد از وصل شدن نود دوباره اعمال می‌شود"
+    NODE_DIRTY.discard(ib["id"])         # خطای کانفیگ/سرویس با تکرار درست نمی‌شود؛ فقط قطعی اتصال دوباره امتحان می‌شود
+    if w:
+        return w
+    st = NODE_STATE.setdefault(nid, dict(ok=True, ts=now(), err="", up={}, ver=n["xray_ver"] or ""))
+    st.setdefault("up", {})[name] = True
+    return ""
+
+
+def vless_teardown_remote(ib):
+    nid = ib_node(ib)
+    n = q("SELECT * FROM nodes WHERE id=?", (nid,), True)
+    if not n:
+        return
+    path, unit = xray_path(ib), xray_unit(ib)
+    script = (node_fw_script(ib, False) + f"; systemctl disable --now {shlex.quote(unit)} >/dev/null 2>&1; "
+              f"rm -f {shlex.quote(path)} {shlex.quote(path[:-5] + '.new.json')} {shlex.quote(path[:-5] + '.add.json')}; true")
+    try:
+        node_call(n, lambda s: s.run(script, timeout=40))
+    except Err as e:
+        log.warning("teardown %s روی نود: %s", ib["name"], e)
+    NODE_DIRTY.discard(ib["id"])
+    ((NODE_STATE.get(nid) or {}).get("up") or {}).pop(ib["name"], None)
+
+
+def node_probe(n):
+    """یک اتصال SSH: نسخه‌ی Xray + وضعیت سرویس هر اینباند + آمار ترافیک؛ نتیجه در NODE_STATE"""
+    nid, xb = n["id"], n["xray_bin"] or XRAY_BIN
+    ibs = {r["name"]: r for r in q("SELECT * FROM inbounds WHERE node_id=? AND proto='vless' AND enabled=1", (nid,))}
+    qx = shlex.quote(xb)
+    parts = [f"echo '@@V'; {qx} version 2>/dev/null | head -1"]
+    for ib in ibs.values():
+        unit, path = shlex.quote(xray_unit(ib)), shlex.quote(xray_path(ib))
+        parts.append(
+            f"echo '@@I {ib['name']}'\n"
+            f"if systemctl is-active --quiet {unit}; then echo 1; "
+            f"P=$(grep -m1 -o '\"port\": *[0-9]*' {path} 2>/dev/null | grep -o '[0-9]*$'); "
+            f"if [ -n \"$P\" ]; then {qx} api statsquery -s=127.0.0.1:$P -pattern 'user>>>' -reset=true 2>/dev/null || echo '{{}}'; "
+            f"else echo '{{}}'; fi; else echo 0; fi")
+    rc, out, err = node_call(n, lambda s: s.run("\n".join(parts), timeout=45))
+    chunks = out.split("@@I ")
+    m = re.search(r"@@V\s*\n([^\n]*)", chunks[0])
+    ver_line = m.group(1).strip() if m else ""
+    mv = re.match(r"Xray\s+(\S+)", ver_line)
+    ver = mv.group(1) if mv else (n["xray_ver"] or "")
+    up = {}
+    for ch in chunks[1:]:
+        nm, _, body_ = ch.partition("\n")
+        nm = nm.strip()
+        flag, _, js = body_.partition("\n")
+        up[nm] = flag.strip() == "1"
+        if up[nm] and nm in ibs and js.strip():
+            _vless_ingest(ibs[nm], js)
+    for nm in ibs:
+        up.setdefault(nm, False)
+    NODE_STATE[nid] = dict(ok=True, ts=now(), err="", up=up, ver=ver)
+    if ver and ver != (n["xray_ver"] or ""):
+        x("UPDATE nodes SET xray_ver=? WHERE id=?", (ver, nid))
+
+
+def node_cycle(n):
+    try:
+        node_probe(n)
+    except Exception as e:
+        st = NODE_STATE.get(n["id"]) or {}
+        NODE_STATE[n["id"]] = dict(st, ok=False, ts=now(), err=str(e)[:200], up={})
+        node_drop(n["id"])
+        return
+    for r in q("SELECT id FROM inbounds WHERE node_id=?", (n["id"],)):
+        if r["id"] in NODE_DIRTY:
+            w = apply_inbound(r["id"])
+            if w:
+                log.warning(w)
+
+
+def node_loop():
+    time.sleep(3)
+    for r in q("SELECT id FROM inbounds WHERE COALESCE(node_id,0)>0"):
+        NODE_DIRTY.add(r["id"])          # بعد از ری‌استارت پنل، همه‌ی اینباندهای نودها یک‌بار با دیتابیس هماهنگ می‌شوند
+    while True:
+        try:
+            ths = [threading.Thread(target=node_cycle, args=(n,), daemon=True) for n in q("SELECT * FROM nodes")]
+            for t in ths:
+                t.start()
+            for t in ths:
+                t.join(60)
+        except Exception:
+            log.exception("nodes")
+        time.sleep(STATS_INTERVAL)
+
+
+def ser_node(n):
+    st = NODE_STATE.get(n["id"]) or {}
+    ni = q("SELECT COUNT(*) c FROM inbounds WHERE node_id=?", (n["id"],), True)["c"]
+    nc = q("""SELECT COUNT(DISTINCT ci.client_id) c FROM client_inbound ci JOIN inbounds i ON i.id=ci.inbound_id
+              WHERE i.node_id=?""", (n["id"],), True)["c"]
+    return dict(id=n["id"], name=n["name"], address=n["address"], ssh_port=n["ssh_port"], ssh_user=n["ssh_user"],
+                note=n["note"], xray_ver=n["xray_ver"], created=n["created"], inbounds=ni, clients=nc,
+                online=bool(st.get("ok")), checked=st.get("ts", 0), error=st.get("err", ""))
+
+
+def node_unkey_script():
+    b = shlex.quote(node_pub().split()[1])
+    return (f"[ -f ~/.ssh/authorized_keys ] && {{ grep -vF {b} ~/.ssh/authorized_keys > ~/.ssh/authorized_keys.tmp; "
+            f"cat ~/.ssh/authorized_keys.tmp > ~/.ssh/authorized_keys; rm -f ~/.ssh/authorized_keys.tmp; }}; true")
+
+
+def node_parse(d, cur=None):
+    nid = cur["id"] if cur else 0
+    name = oneline(d.get("name"))[:40]
+    if not name:
+        raise Err("نام نود را وارد کنید")
+    if q("SELECT 1 FROM nodes WHERE LOWER(name)=LOWER(?) AND id!=?", (name, nid), True):
+        raise Err("این نام برای نود دیگری استفاده شده")
+    addr = str(d.get("address") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9.\-:]{3,253}", addr):
+        raise Err("آی‌پی یا دامنه‌ی نود نامعتبر است")
+    port = num(d.get("ssh_port"), 22, 1, 65535, "پورت SSH")
+    if q("SELECT 1 FROM nodes WHERE address=? AND ssh_port=? AND id!=?", (addr, port, nid), True):
+        raise Err("این سرور قبلاً به‌عنوان نود اضافه شده")
+    return dict(name=name, address=addr, ssh_port=port, note=oneline(d.get("note"))[:100])
+
+
+def node_job(j, d):
+    """افزودن نود؛ در یک ترد جدا اجرا می‌شود و مراحل را در j['steps'] می‌نویسد."""
+    steps = j["steps"]
+    rs, key_added = None, False
+
+    def step(t):
+        s = {"t": t, "s": "run", "m": ""}
+        steps.append(s)
+        return s
+
+    def ok(s, m=""):
+        s["s"] = "ok"; s["m"] = m
+
+    try:
+        s = step("اتصال SSH با رمز")
+        rs = _Remote(d["address"], d["ssh_port"], d["ssh_user"], d["ssh_pass"])
+        rc, o, e = rs.run("id -u; uname -m; test -d /run/systemd/system && echo systemd || echo nosystemd; "
+                          "cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo none")
+        f = o.split()
+        if len(f) < 3 or f[0] != "0":
+            raise Err("کاربر SSH باید root باشد")
+        lb = (_read("/proc/sys/kernel/random/boot_id") or "").strip()
+        if lb and len(f) > 3 and f[3] == lb:
+            raise Err("این همان سروری است که پنل روی آن نصب است؛ خود پنل «نود اصلی» حساب می‌شود و لازم نیست اضافه شود")
+        if f[2] != "systemd":
+            raise Err("این سرور systemd ندارد؛ نود فقط روی لینوکس با systemd کار می‌کند")
+        arch = f[1]
+        ok(s, f"متصل شد ({arch})")
+
+        s = step("نصب کلید پنل روی نود (رمز ذخیره نمی‌شود)")
+        pub = node_pub()
+        rc, o, e = rs.run("mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && "
+                          "{ [ ! -s ~/.ssh/authorized_keys ] || [ -z \"$(tail -c1 ~/.ssh/authorized_keys)\" ] || echo >> ~/.ssh/authorized_keys; } && "
+                          f"{{ grep -qF {shlex.quote(pub.split()[1])} ~/.ssh/authorized_keys || echo {shlex.quote(pub)} >> ~/.ssh/authorized_keys; }}")
+        if rc != 0:
+            raise Err("نوشتن authorized_keys روی نود ناموفق بود: " + (o + e).strip()[:200])
+        key_added = True
+        rs.close(); rs = None
+        try:
+            rs = _Remote(d["address"], d["ssh_port"], d["ssh_user"], None, key=node_key())
+        except Err:
+            raise Err("ورود با کلید ممکن نشد؛ احتمالاً PubkeyAuthentication روی SSH نود غیرفعال است")
+        ok(s, "ورود با کلید تأیید شد")
+
+        s = step("بررسی و نصب Xray-core روی نود")
+        rc, o, e = rs.run(XRAY_NODE_INSTALL, timeout=300)
+        xb = "/usr/local/bin/xray"
+        if rc == 4:               # نود به GitHub دسترسی ندارد → از روی پنل کپی می‌کنیم (اگر معماری یکی باشد)
+            msg = ensure_xray()
+            lb = xray_bin()
+            if msg or not lb:
+                raise Err("دانلود Xray روی نود ناموفق بود و روی پنل هم نشد: " + (msg or ""))
+            norm = lambda a: {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(a.strip().lower(), a.strip().lower())
+            if norm(platform.machine()) != norm(arch):
+                raise Err(f"نود به GitHub دسترسی ندارد و معماری پنل ({platform.machine()}) با نود ({arch}) فرق دارد")
+            with open(lb, "rb") as fh:
+                rs.put(xb, fh.read(), 0o755)
+            ok(s, "از روی پنل کپی شد (نود به GitHub دسترسی نداشت)")
+        elif rc != 0:
+            raise Err("نصب Xray ناموفق بود: " + (o + e).strip()[-250:])
+        else:
+            mb = re.search(r"^BIN=(\S+)$", o, re.M)
+            xb = mb.group(1) if mb else xb
+            vl = [ln for ln in o.splitlines() if ln and not ln.startswith("BIN=")]
+            ok(s, vl[-1] if vl else "نصب شد")
+        rc, o, e = rs.run(f"{shlex.quote(xb)} version | head -1")
+        mv = re.match(r"Xray\s+(\S+)", o.strip())
+        if rc != 0 or not mv:
+            raise Err("Xray روی نود اجرا نمی‌شود: " + (o + e).strip()[:200])
+        ver = mv.group(1)
+
+        s = step("ساخت سرویس systemd و پوشه‌ی کانفیگ")
+        rs.run(f"mkdir -p {shlex.quote(XRAY_DIR)}")
+        rs.put(XRAY_UNIT, xray_unit_text(xb), 0o644)
+        rc, o, e = rs.run("systemctl daemon-reload")
+        if rc != 0:
+            raise Err("systemctl daemon-reload ناموفق بود: " + (o + e).strip()[:200])
+        ok(s)
+
+        s = step("ثبت نود در پنل")
+        nid = x("INSERT INTO nodes(name,address,ssh_port,ssh_user,xray_bin,xray_ver,note,created) VALUES(?,?,?,?,?,?,?,?)",
+                (d["name"], d["address"], d["ssh_port"], d["ssh_user"], xb, ver, d["note"], now()))
+        NODE_STATE[nid] = dict(ok=True, ts=now(), err="", up={}, ver=ver)
+        ok(s, "نود آماده است؛ حالا می‌توانید روی آن اینباند VLESS بسازید")
+        key_added = False
+        j["state"] = "done"
+    except Exception as e:
+        log.warning("node_job: %s", e)
+        for s_ in steps:
+            if s_["s"] == "run":
+                s_["s"] = "err"; s_["m"] = str(e)
+        if not steps or steps[-1]["s"] != "err":
+            steps.append({"t": "خطا", "s": "err", "m": str(e)})
+        if key_added and rs:
+            try:
+                rs.run(node_unkey_script())
+            except Exception:
+                pass
+        j["state"] = "failed"
+    finally:
+        if rs:
+            rs.close()
+
+
+@app.post("/api/nodes")
+@auth
+def node_create():
+    d = body()
+    v = node_parse(d)
+    user = str(d.get("ssh_user") or "root").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,32}", user):
+        raise Err("نام کاربری SSH نامعتبر است")
+    pw = str(d.get("ssh_pass") or "")
+    if not pw:
+        raise Err("رمز SSH نود را وارد کنید")
+    for j in NODE_JOBS.values():
+        if j["state"] == "run":
+            raise Err("یک نود دیگر در حال اضافه شدن است؛ صبر کنید")
+    jid = secrets.token_hex(6)
+    j = {"state": "run", "steps": [], "name": v["name"]}
+    NODE_JOBS[jid] = j
+    while len(NODE_JOBS) > 20:
+        NODE_JOBS.popitem(last=False)
+    threading.Thread(target=node_job, args=(j, dict(v, ssh_user=user, ssh_pass=pw)), daemon=True).start()
+    return jsonify(ok=True, job=jid)
+
+
+@app.get("/api/nodes/job/<jid>")
+@auth
+def node_job_state(jid):
+    j = NODE_JOBS.get(jid)
+    if not j:
+        raise Err("کار پیدا نشد")
+    return jsonify(state=j["state"], steps=j["steps"], name=j["name"])
+
+
+@app.put("/api/nodes/<int:nid>")
+@auth
+def node_update(nid):
+    cur = q("SELECT * FROM nodes WHERE id=?", (nid,), True) or abort(404)
+    v = node_parse(body(), cur)
+    x("UPDATE nodes SET name=?, address=?, ssh_port=?, note=? WHERE id=?", (v["name"], v["address"], v["ssh_port"], v["note"], nid))
+    if (v["address"], v["ssh_port"]) != (cur["address"], cur["ssh_port"]):
+        node_drop(nid)
+    return jsonify(ok=True)
+
+
+@app.post("/api/nodes/<int:nid>/check")
+@auth
+def node_check(nid):
+    n = q("SELECT * FROM nodes WHERE id=?", (nid,), True) or abort(404)
+    try:
+        node_probe(n)
+    except Err as e:
+        NODE_STATE[nid] = dict(NODE_STATE.get(nid) or {}, ok=False, ts=now(), err=str(e)[:200], up={})
+        raise
+    return jsonify(ok=True, node=ser_node(q("SELECT * FROM nodes WHERE id=?", (nid,), True)))
+
+
+@app.delete("/api/nodes/<int:nid>")
+@auth
+def node_delete(nid):
+    n = q("SELECT * FROM nodes WHERE id=?", (nid,), True) or abort(404)
+    ibs = q("SELECT * FROM inbounds WHERE node_id=?", (nid,))
+    if ibs and request.args.get("force") != "1":
+        raise Err(f"این نود {len(ibs)} اینباند دارد؛ با حذف نود، اینباندها و اتصال کلاینت‌ها به آن‌ها هم حذف می‌شود")
+    for ib in ibs:
+        vless_teardown_remote(ib)
+        x("DELETE FROM inbounds WHERE id=?", (ib["id"],))
+    warn = ""
+    try:
+        node_call(n, lambda s: s.run(f"rm -f {shlex.quote(XRAY_UNIT)}; rm -rf {shlex.quote(XRAY_DIR)}; systemctl daemon-reload; "
+                                     + node_unkey_script(), timeout=40))
+    except Err as e:
+        warn = f"نود از پنل حذف شد ولی پاک‌سازی روی خود سرور انجام نشد ({e}). کلید «sepipanel» را از ~/.ssh/authorized_keys آن سرور دستی پاک کنید."
+    node_drop(nid)
+    NODE_STATE.pop(nid, None)
+    x("DELETE FROM nodes WHERE id=?", (nid,))
+    return jsonify(ok=True, warn=warn)
+
+
 # ------------------------------ وضعیت سیستم (فقط مدیر اصلی) ------------------------------
 PROC_START = time.time()
 HIST = collections.deque(maxlen=180)      # ۱۸۰ نمونه × ۵ ثانیه = ۱۵ دقیقه اخیر
@@ -3222,6 +3777,7 @@ def state_super():
         settings=dict(public_url=setting("public_url"), sub_title=setting("sub_title", "WireGuard"), sub_telegram=setting("sub_telegram", ""),
                       update_interval=int(setting("update_interval", "12") or 12)),
         role="super", admins=[ser_admin(a) for a in q("SELECT * FROM admins ORDER BY id DESC")],
+        nodes=[ser_node(n) for n in q("SELECT * FROM nodes ORDER BY id")],
         defaults=inbound_defaults(), panel=panel_info(),
         server=dict(wg=(ver.strip() if rc2 == 0 else ""), awg=(aver.strip() if rc3 == 0 else ""), nat_iface=detect_iface(), qr=bool(qrcode),
                     now=now(), base=base_url()))
@@ -4191,7 +4747,7 @@ function showLogin(){staStop();$('#app').innerHTML=`<div class="login"><div clas
 async function doLogin(){try{await api('/login','POST',{u:$('#lu').value,p:$('#lp').value});load()}catch(e){toast(e.message,1)}}
 async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1)}}
 const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad']};
-const NAV=[['sta','وضعیت','pulse','وضعیت لحظه‌ای سرور و وایرگارد: CPU، رم، دیسک، سرعت شبکه و اتصال‌ها.'],['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
+const NAV=[['sta','وضعیت','pulse','وضعیت لحظه‌ای سرور و وایرگارد: CPU، رم، دیسک، سرعت شبکه و اتصال‌ها.'],['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['nod','نودها','server','نود = سرور جداگانه با لوکیشن خودش. اینباندهای VLESS روی هر نود ساخته می‌شوند و همه در یک لینک ساب جمع می‌شوند.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
 NAV.push(['tun','تانل','tun','ساخت و مدیریت تانل BackPack بین سرور ایران و خارج؛ فقط با وارد کردن مشخصات SSH سرور مقابل.']);
 const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.']];
 const isA=()=>S&&S.role==='admin';
@@ -4206,7 +4762,7 @@ function render(){
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
  <div class="st"><span class="si bl">${ic('pulse')}</span><span class="l">آنلاین</span><b>${on}</b></div>
  <div class="st"><span class="si o">${ic('db')}</span><span class="l">مصرف کل</span><b>${fmtB(tot)}</b></div></div>
- ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():TAB=='tun'?tunHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
+ ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():TAB=='tun'?tunHTML():TAB=='nod'?nodHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
 async function logout(){await api('/logout','POST');showLogin()}
 /* ---------- تانل (BackPack) ---------- */
 let TUN=null,TUNT=null;
@@ -4245,9 +4801,40 @@ function tunProg(m,job){const box=m.querySelector('#tnF');m.querySelector('#tn_s
   box.innerHTML=d.steps.map(s=>`<div class="stp ${s.s}"><i>${s.s=='ok'?'✔':s.s=='err'?'✖':s.s=='warn'?'!':'…'}</i><div>${esc(s.t)}${s.m?`<small>${esc(s.m)}</small>`:''}</div></div>`).join('')+
   (d.state=='done'?'<div class="b ok" style="margin-top:10px">تانل برقرار شد. به‌محض عبور ترافیک، وضعیتش «آنلاین» می‌شود.</div>':d.state=='warn'?'<div class="b warn" style="margin-top:10px">ساخته شد ولی هنوز وصل نشده؛ وضعیت را در لیست تانل‌ها دنبال کنید.</div>':d.state=='failed'?'<div class="b bad" style="margin-top:10px">ساخت تانل ناموفق بود و تغییرات برگردانده شد.</div>':'');
   if(d.state=='run')setTimeout(loop,1500);else tunLoad()};loop()}
+/* ---------- نودها ---------- */
+const nodName=id=>{if(!id)return 'این سرور';const n=(S.nodes||[]).find(x=>x.id==id);return n?n.name:'#'+id};
+const NODF=[{k:'name',l:'نام نود',h:'فقط یک برچسب است؛ هر وقت خواستید عوضش کنید.'},{k:'note',l:'توضیح / لوکیشن (اختیاری)',rtl:1},{k:'address',l:'آدرس نود (IP یا دامنه)',h:'همین آدرس برای SSH و برای لینک کلاینت‌ها استفاده می‌شود (مگر در اینباند «آدرس عمومی» دیگری بگذارید).'},{k:'ssh_port',l:'پورت SSH',t:'number'}];
+function nodHTML(){
+ const li=S.inbounds.filter(i=>!i.node_id),ids=new Set(li.map(i=>i.id)),lc=S.clients.filter(c=>c.links.some(l=>ids.has(l.inbound_id))).length;
+ return `<div class="bar2"><span class="mut sm">هر نود یک سرور جداست؛ موقع ساخت اینباند VLESS نود را انتخاب می‌کنید و همه‌ی آن‌ها در یک لینک ساب جمع می‌شوند.</span><button class="p" onclick="nodNew()">+ نود جدید</button></div>
+ <article class="card up"><div class="row"><h3>این سرور<small>نود اصلی (پنل)</small></h3><span class="b ok">آنلاین</span></div><div class="meta"><span>اینباندها: <b>${li.length}</b></span><span>کلاینت‌ها: <b>${lc}</b></span></div></article>`
+ +(S.nodes||[]).map(n=>`<article class="card ${n.online?'up':''}"><div class="row"><h3>${esc(n.name)}<small>${esc(n.note)}</small>${n.xray_ver?` <span class="tag">Xray ${esc(n.xray_ver)}</span>`:''}</h3><span class="b ${n.online?'ok':'bad'}">${n.online?'آنلاین':'قطع'}</span></div>
+ <div class="meta"><span>آدرس: <b style="direction:ltr;display:inline-block">${esc(n.address)}</b></span><span>SSH: <b style="direction:ltr;display:inline-block">${esc(n.ssh_user)}@:${n.ssh_port}</b></span><span>اینباندها: <b>${n.inbounds}</b></span><span>کلاینت‌ها: <b>${n.clients}</b></span>${!n.online&&n.error?`<span style="color:#f87171">${esc(n.error)}</span>`:''}</div>
+ <div class="acts"><button class="s" onclick="nodNewInb(${n.id})">+ اینباند روی این نود</button><button class="s" onclick="nodEdit(${n.id})">ویرایش</button><button class="s" onclick="nodCheck(${n.id})">بررسی اتصال</button><button class="s d" onclick="nodDel(${n.id})">حذف</button></div></article>`).join('')
+ +((S.nodes||[]).length?'':'<div class="empty">هنوز نودی اضافه نکرده‌اید. با «نود جدید» اطلاعات SSH سرور را بدهید؛ بقیه‌ی کارها خودکار انجام می‌شود.</div>')}
+function nodNewInb(id){newInb({proto:'vless',node_id:String(id)})}
+function nodEdit(id){const n=S.nodes.find(x=>x.id==id);formModal('ویرایش نود '+esc(n.name),NODF,{...n},true,o=>act(()=>api('/nodes/'+id,'PUT',o),'ذخیره شد'))}
+async function nodCheck(id){try{toast('در حال بررسی…');await api('/nodes/'+id+'/check','POST');toast('اتصال به نود برقرار است');await load()}catch(e){toast(e.message,1);load()}}
+async function nodDel(id){const n=S.nodes.find(x=>x.id==id);if(!confirm(n.inbounds?`نود «${n.name}» همراه با ${n.inbounds} اینباندش حذف شود؟ کلاینت‌ها از این اینباندها جدا می‌شوند.`:`نود «${n.name}» حذف شود؟`))return;
+ try{const r=await api('/nodes/'+id+(n.inbounds?'?force=1':''),'DELETE');toast(r.warn||'حذف شد',!!r.warn);await load()}catch(e){toast(e.message,1)}}
+function nodNew(){
+ const m=modal(`<h2>نود جدید</h2><div id="ndF"><div class="g2"><div class="fg"><label>نام نود</label><input id="nd_nm" placeholder="مثلاً آلمان"></div><div class="fg"><label>توضیح / لوکیشن (اختیاری)</label><input id="nd_note"></div>
+ <div class="fg"><label>آی‌پی یا دامنه‌ی سرور نود</label><input id="nd_ip" dir="ltr" placeholder="1.2.3.4"></div><div class="fg"><label>پورت SSH</label><input id="nd_sp" dir="ltr" value="22"></div>
+ <div class="fg"><label>یوزرنیم SSH (باید root باشد)</label><input id="nd_su" dir="ltr" value="root"></div><div class="fg"><label>رمز SSH</label><input id="nd_pw" type="password" dir="ltr" autocomplete="off"></div></div>
+ <small class="mut" style="display:block;margin-top:10px">مراحل خودکار: اتصال SSH ← نصب کلید پنل روی نود (رمز ذخیره نمی‌شود و بعدش با کلید وصل می‌شود) ← نصب Xray-core ← ساخت سرویس ← ثبت نود.</small></div>
+ <div class="mfoot"><button class="s" id="nd_c">بستن</button><button class="p" id="nd_s">شروع افزودن نود</button></div>`);
+ m.querySelector('#nd_c').onclick=()=>{m.remove();load()};
+ m.querySelector('#nd_s').onclick=async()=>{const g=i=>m.querySelector('#'+i);
+  const b={name:g('nd_nm').value.trim(),note:g('nd_note').value.trim(),address:g('nd_ip').value.trim(),ssh_port:g('nd_sp').value,ssh_user:g('nd_su').value.trim(),ssh_pass:g('nd_pw').value};
+  try{const r=await api('/nodes','POST',b);nodProg(m,r.job)}catch(e){toast(e.message,1)}}}
+function nodProg(m,job){const box=m.querySelector('#ndF');m.querySelector('#nd_s').remove();
+ const loop=async()=>{if(!document.body.contains(m))return;let d;try{d=await api('/nodes/job/'+job)}catch(e){toast(e.message,1);return}
+  box.innerHTML=d.steps.map(s=>`<div class="stp ${s.s}"><i>${s.s=='ok'?'✔':s.s=='err'?'✖':s.s=='warn'?'!':'…'}</i><div>${esc(s.t)}${s.m?`<small>${esc(s.m)}</small>`:''}</div></div>`).join('')+
+  (d.state=='done'?'<div class="b ok" style="margin-top:10px">نود اضافه شد. حالا موقع ساخت اینباند VLESS می‌توانید آن را انتخاب کنید.</div>':d.state=='failed'?'<div class="b bad" style="margin-top:10px">افزودن نود ناموفق بود.</div>':'');
+  if(d.state=='run')setTimeout(loop,1500);else load()};loop()}
 /* ---------- اینباندها ---------- */
 function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
- (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
+ (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
  <span class="b ${i.enabled?(i.up?'ok':'warn'):''}">${i.enabled?(i.up?'بالا':'پایین (خطا؟)'):'غیرفعال'}</span></div>
  <div class="meta"><span>پورت: <b>${i.proto==='l2tp'?'500, 4500/udp':i.proto==='ovpn'?i.port+'/'+esc(i.ovpn.transport):i.proto==='vless'?i.port+'/'+i.net:i.port+'/udp'}</b></span>${i.proto==='vless'?'':`<span>IPv4: <b>${esc(i.address4)}</b></span>`}${i.address6?`<span>IPv6: <b>${esc(i.address6)}</b></span>`:''}
  <span>Endpoint: <b>${esc(i.endpoint||'(آدرس پنل)')}${i.endpoint_port?':'+i.endpoint_port:''}</b></span><span>DNS: <b>${esc(i.dns||'—')}</b></span>
@@ -4274,6 +4861,7 @@ async function genObf(){try{const r=await api('/obf/generate?v='+$('#f_obf_ver')
 const XFP=['chrome','firefox','safari','ios','android','edge','360','qq','random','randomized',''];
 const INB=[{s:'اصلی'},
  {k:'proto',l:'پروتکل',t:'select',opts:[['wg','WireGuard'],['l2tp','L2TP/IPsec — برای مودم، روتر و گوشی (بدون نیاز به اپ)'],['ovpn','OpenVPN — اپ OpenVPN، مودم و روتر (UDP/TCP)'],['vless','VLESS — Xray (Reality / TLS / WS / gRPC / xHTTP / mKCP)']],lock:1,h:'پروتکل بعد از ساخت اینباند قابل تغییر نیست. از L2TP فقط یک اینباند می‌شود ساخت.'},
+ {k:'node_id',l:'نود (سروری که این اینباند روی آن ساخته می‌شود)',t:'select',p:'vless',lock:1,opts:()=>[['0','این سرور (پنل اصلی)'],...(S.nodes||[]).map(n=>[String(n.id),esc(n.name)+' — '+esc(n.address)])],h:'بعد از ساخت قابل تغییر نیست. روی نود، گواهی «پنل» عیناً به نود کپی می‌شود و مسیر «فایل گواهی» باید روی خود نود باشد. لینک کلاینت‌ها به آدرس همان نود می‌رود.'},
  {k:'name',l:'نام اینباند',h:'مثل wg0 یا l2tp — حداکثر ۱۵ حرف انگلیسی'},{k:'remark',l:'توضیح',rtl:1},
  {k:'port',l:'پورت',t:'number',p:'wg ovpn vless',h:'وایرگارد UDP است؛ OpenVPN پیش‌فرض 1194 (برای عبور از فیلتر می‌توانید TCP/443 بگذارید)'},{k:'address4',l:'آدرس سرور IPv4 / ساب‌نت',ph:'10.8.0.1/24',p:'wg l2tp ovpn',h:'در L2TP: آی‌پی گیت‌وی داخل VPN؛ بقیه‌ی رنج به کلاینت‌ها داده می‌شود'},
  {k:'psk',l:'کلید IPsec (Pre-shared key)',p:'l2tp',h:'همه‌ی کلاینت‌ها همین کلید را در مودم/روتر وارد می‌کنند. پورت‌های UDP ‏500 و 4500 را در فایروال باز کنید.'},
@@ -4355,7 +4943,7 @@ function fieldInner(f,v,edit){
  if(f.s)return `<h4>${f.s}</h4>`;if(f.edit&&!edit)return '';if(f.t==='btn')return `<div class="fg"><button type="button" class="s" onclick="${f.on}">${f.l}</button></div>`;
  let val=v[f.k];if(val==null)val='';const id='f_'+f.k;const h=f.h?`<small>${f.h}</small>`:'';
  if(f.t==='check')return `<div class="fg"><label class="chk"><input type="checkbox" id="${id}" ${val?'checked':''}> ${f.l}</label>${h}</div>`;
- if(f.t==='select')return `<div class="fg"><label>${f.l}</label><select id="${id}" ${f.lock&&edit?'disabled':''}>${f.opts.map(([a,b])=>`<option value="${a}" ${String(val)===a?'selected':''}>${b}</option>`).join('')}</select>${h}</div>`;
+ if(f.t==='select')return `<div class="fg"><label>${f.l}</label><select id="${id}" ${f.lock&&edit?'disabled':''}>${(typeof f.opts==='function'?f.opts():f.opts).map(([a,b])=>`<option value="${a}" ${String(val)===a?'selected':''}>${b}</option>`).join('')}</select>${h}</div>`;
  if(f.t==='textarea')return `<div class="fg"><label>${f.l}</label><textarea id="${id}" spellcheck="false">${esc(val)}</textarea>${h}</div>`;
  return `<div class="fg"><label>${f.l}</label><input id="${id}" type="${f.t==='number'?'number':f.t||'text'}" value="${esc(val)}" placeholder="${esc(f.ph||'')}" ${f.rtl?'style="direction:rtl;text-align:right"':''}>${h}</div>`}
 function collect(fields,edit){const o={};for(const f of fields){if(f.s||f.t==='btn'||(f.edit&&!edit))continue;const e=$('#f_'+f.k);const v=f.t==='check'?e.checked:e.value;if(f.k.startsWith('o_')){(o.obf=o.obf||{})[f.k.slice(2)]=v}else if(f.k.startsWith('v_')){(o.ovpn=o.ovpn||{})[f.k.slice(2)]=v}else if(f.k.startsWith('x_')){(o.xcfg=o.xcfg||{})[f.k.slice(2)]=v}else o[f.k]=v}return o}
@@ -4372,7 +4960,7 @@ function formModal(title,fields,vals,edit,onSave){
      if(!edit){const d=DM[ps.value];for(const k of ['name','port','mtu']){const e=g(k);if(e&&d[k]!=null&&(k!=='name'||/^(wg\d*|l2tp|ovpn|vless)$/.test(e.value)))e.value=d[k]}}};
    ps.onchange=ap;m.addEventListener('change',ap);ap()}
  m.querySelector('#ms').onclick=async()=>{if(await onSave(collect(fields,edit)))m.remove()}}
-function newInb(){const d=S.defaults;formModal('اینباند جدید',INB,{...d,obf_ver:'3',proto:'wg',...Object.fromEntries(Object.entries(d.ovpn||{}).map(([k,v])=>['v_'+k,v])),...Object.fromEntries(Object.entries(d.xcfg||{}).map(([k,v])=>['x_'+k,v]))},false,o=>act(()=>api('/inbounds','POST',o),'اینباند ساخته شد'))}
+function newInb(pre={}){const d=S.defaults;formModal('اینباند جدید',INB,{...d,obf_ver:'3',proto:'wg',...Object.fromEntries(Object.entries(d.ovpn||{}).map(([k,v])=>['v_'+k,v])),...Object.fromEntries(Object.entries(d.xcfg||{}).map(([k,v])=>['x_'+k,v])),...pre},false,o=>act(()=>api('/inbounds','POST',o),'اینباند ساخته شد'))}
 function editInb(id){const i=S.inbounds.find(x=>x.id==id);formModal('ویرایش اینباند '+esc(i.name),INB,{...i,private_key:'',obf_ver:'3',...Object.fromEntries(Object.entries(i.obf||{}).map(([k,v])=>['o_'+k,v])),...Object.fromEntries(Object.entries(i.ovpn||{}).map(([k,v])=>['v_'+k,v])),...Object.fromEntries(Object.entries(i.xcfg||{}).map(([k,v])=>['x_'+k,v])),x_reality_priv:''},true,o=>act(()=>api('/inbounds/'+id,'PUT',o),'ذخیره شد'))}
 function delInb(id,n){if(confirm(`اینباند ${n} و اتصال همه کلاینت‌هایش حذف شود؟`))act(()=>api('/inbounds/'+id,'DELETE'),'حذف شد')}
 async function showConf(id){try{const r=await api('/inbounds/'+id+'/conf');const m=modal(`<h2>کانفیگ سرور</h2><pre class="cf">${esc(r.conf)}</pre><div class="mfoot"><button class="s" id="x">بستن</button></div>`);m.querySelector('#x').onclick=()=>m.remove()}catch(e){toast(e.message,1)}}
@@ -4414,7 +5002,7 @@ const CLI=[{k:'name',l:'نام کلاینت',rtl:1},{k:'count',l:'تعداد (س
  {k:'note',l:'یادداشت',rtl:1},{k:'limit_gb',l:'محدودیت حجم (گیگابایت)',t:'number',h:'۰ = نامحدود'},
  {k:'reset_period',l:'ریست خودکار ترافیک',t:'select',opts:[['','هرگز'],['daily','روزانه'],['weekly','هفتگی'],['monthly','ماهانه (هر ۳۰ روز)']]}];
 function linkBlock(ib,L){const v=L||{};const f=(k,l,ph)=>`<div class="fg"><label>${l}</label><input class="l_${k}" value="${esc(v[k]??'')}" placeholder="${ph||''}"></div>`;
- return `<div class="lk" data-ib="${ib.id}"><label class="chk"><input type="checkbox" class="lkc" ${L?'checked':''}> <b>${esc(ib.name)}</b> <span class="mut">${esc(ib.remark)}${ib.proto==='vless'?'':' · '+esc(ib.address4)}</span>${ib.proto==='l2tp'?' <span class="tag">L2TP</span>':''}${ib.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${ib.proto==='vless'?' <span class="tag">VLESS</span>':''}</label>
+ return `<div class="lk" data-ib="${ib.id}"><label class="chk"><input type="checkbox" class="lkc" ${L?'checked':''}> <b>${esc(ib.name)}</b> <span class="mut">${esc(ib.remark)}${ib.proto==='vless'?'':' · '+esc(ib.address4)}</span>${ib.proto==='l2tp'?' <span class="tag">L2TP</span>':''}${ib.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${ib.proto==='vless'?' <span class="tag">VLESS</span>':''}${ib.node_id?` <span class="tag">${esc(nodName(ib.node_id))}</span>`:''}</label>
  <details ${isA()||ib.proto!=='wg'?'hidden':''}><summary>تنظیمات ویژه این کلاینت در این اینباند</summary><div class="g2">${f('ip4','IPv4 ثابت','خودکار')}${f('allowed_ips','AllowedIPs کلاینت','پیش‌فرض اینباند')}
  ${f('keepalive','Keepalive','پیش‌فرض اینباند (۰=خاموش)')}${f('dns','DNS','پیش‌فرض اینباند')}${f('mtu','MTU','پیش‌فرض اینباند')}${f('extra_allowed','AllowedIPs اضافه سمت سرور','مثلا 192.168.50.0/24')}</div></details></div>`}
 function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_bytes/1024**3).toFixed(3):0}:{limit_gb:0,count:1};
@@ -4689,6 +5277,7 @@ def main():
     threading.Thread(target=reconcile, daemon=True).start()
     threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=sys_loop, daemon=True).start()
+    threading.Thread(target=node_loop, daemon=True).start()
     log.info("SepiPanel روی %s://%s:%s/%s", "https" if tls else "http", PANEL_HOST, c["port"], c["path"])
     app.run(host=PANEL_HOST, port=c["port"], threaded=True, ssl_context=tls)
 
