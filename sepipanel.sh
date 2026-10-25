@@ -157,7 +157,7 @@ do_update() {
 do_uninstall() {
   [ "$(ask 'Remove the panel service and the sepipanel command? (y/N): ')" = "y" ] || return
   systemctl disable --now $SVC 2>/dev/null; rm -f /etc/systemd/system/sepipanel.service; systemctl daemon-reload
-  ok "Service removed. Data kept in $DIR (delete with: rm -rf $DIR). WireGuard configs are untouched."
+  ok "Service removed. Data kept in $DIR (delete with: rm -rf $DIR). VPN configs (WireGuard/OpenVPN/Xray/L2TP) are untouched."
   rm -f /usr/local/bin/sepipanel; exit 0
 }
 

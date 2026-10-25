@@ -4,7 +4,7 @@
 # آپدیت:  همان دستور بالا را دوباره اجرا کنید (دیتابیس و رمز حفظ می‌شود)
 # حذف:    sepipanel uninstall   (یا: bash <(curl -fsSL .../install.sh) uninstall)
 # منو:    sepipanel
-# متغیرها: PORT=8080  AWG=1 (نصب AmneziaWG)  BRANCH=main
+# متغیرها: PORT=8080  AWG=1 (نصب AmneziaWG)  XRAY=1 (نصب Xray-core برای VLESS؛ وگرنه موقع ساخت اینباند VLESS خودکار دانلود می‌شود)  OVPN=1 (نصب OpenVPN؛ وگرنه موقع ساخت اینباند خودکار نصب می‌شود)  L2TP=1 (نصب xl2tpd+strongSwan؛ وگرنه موقع ساخت اینباند L2TP خودکار نصب می‌شود)  BRANCH=main
 set -euo pipefail
 
 # ====== اینجا را با ریپوی خودتان عوض کنید ======
@@ -44,6 +44,30 @@ if [ "${AWG:-0}" = "1" ]; then
   add-apt-repository -y ppa:amnezia/ppa || true
   apt-get update -y
   apt-get install -y amneziawg amneziawg-tools || echo "نصب AmneziaWG ناموفق بود؛ ادامه بدون آن"
+fi
+
+if [ "${L2TP:-0}" = "1" ]; then
+  echo ">> نصب L2TP/IPsec..."
+  apt-get install -y xl2tpd strongswan || echo "نصب xl2tpd/strongswan ناموفق بود؛ ادامه بدون آن"
+  apt-get install -y strongswan-starter || true
+fi
+
+if [ "${OVPN:-0}" = "1" ]; then
+  echo ">> نصب OpenVPN..."
+  apt-get install -y openvpn openssl || echo "نصب openvpn ناموفق بود؛ ادامه بدون آن"
+fi
+
+if [ "${XRAY:-0}" = "1" ] && [ ! -x /usr/local/bin/xray ]; then
+  echo ">> نصب Xray-core..."
+  python3 - <<'PYX' || echo "نصب Xray ناموفق بود؛ هنگام ساخت اینباند VLESS دوباره تلاش می‌شود"
+import platform, urllib.request, zipfile, tempfile, os, shutil
+a = {"x86_64": "64", "amd64": "64", "aarch64": "arm64-v8a", "arm64": "arm64-v8a", "armv7l": "arm32-v7a"}[platform.machine().lower()]
+d = tempfile.mkdtemp(); z = d + "/x.zip"
+urllib.request.urlretrieve(f"https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-{a}.zip", z)
+with zipfile.ZipFile(z) as f, f.open("xray") as src, open("/usr/local/bin/xray", "wb") as dst:
+    shutil.copyfileobj(src, dst)
+os.chmod("/usr/local/bin/xray", 0o755)
+PYX
 fi
 
 echo ">> دانلود پنل..."
@@ -118,6 +142,7 @@ if systemctl is-active --quiet sepipanel; then
   echo " (تغییر پورت/دامنه/SSL/رمز/مسیر مخفی، بکاپ، آپدیت و ...)"
   echo " لاگ:   journalctl -u sepipanel -f"
   echo " نکته: پورت‌های UDP اینباندهای وایرگارد را هم در فایروال/پنل هاستینگ باز کنید."
+  echo "       برای اینباند L2TP پورت‌های UDP ‏500 و 4500 و برای OpenVPN و VLESS پورت اینباند را باز کنید (یا گزینهٔ فایروال خودکار را فعال کنید)."
 else
   echo "سرویس بالا نیامد؛ لاگ: journalctl -u sepipanel -e"
   exit 1
