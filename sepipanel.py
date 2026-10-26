@@ -5583,16 +5583,16 @@ async function doLogin(){try{await api('/login','POST',{u:$('#lu').value,p:$('#l
 async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1)}}
 const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad'],key:['غیرفعال (سقف کلید)','bad']};
 const NAV=[['sta','وضعیت','pulse','وضعیت لحظه‌ای سرور و وایرگارد: CPU، رم، دیسک، سرعت شبکه و اتصال‌ها.'],['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['nod','نودها','server','نود = سرور جداگانه با لوکیشن خودش. اینباندهای VLESS روی هر نود ساخته می‌شوند و همه در یک لینک ساب جمع می‌شوند.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
-NAV.push(['api','API و مستندات','api','اتصال پنل به ربات تلگرام یا سایت برای فروش خودکار: کلید API بسازید و طبق مستندات زیر کلاینت بسازید، تمدید کنید و لینک اشتراک را تحویل بدهید.']);
 NAV.push(['tun','تانل','tun','ساخت و مدیریت تانل BackPack بین سرور ایران و خارج؛ هر سمت می‌تواند همین سرور، یکی از نودها یا سرور دیگری با SSH باشد.']);
+NAV.push(['api','API و مستندات','api','اتصال پنل به ربات تلگرام یا سایت برای فروش خودکار: کلید API بسازید و طبق مستندات زیر کلاینت بسازید، تمدید کنید و لینک اشتراک را تحویل بدهید.']);
 const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.'],['api','API و مستندات','api','کلید API خودتان را بسازید، سقف حجم و زمانش را کم و زیاد کنید و ربات یا سایتتان را وصل کنید؛ مصرف فقط از کلاینت‌هایی که با همان کلید ساخته می‌شوند کم می‌شود.']];
 const isA=()=>S&&S.role==='admin';
 function render(){
  const NV=isA()?NAV_A:NAV;if(!NV.find(n=>n[0]==TAB))TAB='cli';
  const on=S.clients.filter(c=>c.online).length,tot=S.clients.reduce((a,c)=>a+c.up_bytes+c.down_bytes,0),cur=NV.find(n=>n[0]==TAB);
- $('#app').innerHTML=`<div class="shell"><aside class="side"><div class="brand"><span class="lg">${ic('shield')}</span><div><b>SepiPanel</b><small>مدیریت WireGuard</small></div></div>
+ $('#app').innerHTML=`<div class="shell"><aside class="side"><div class="brand"><span class="lg">${ic('shield')}</span><div><b>SepiPanel</b><small>پنل مدیریت</small></div></div>
  <nav class="nav">${NV.map(([k,l,i])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${ic(i)}<span>${l}</span></button>`).join('')}<button onclick="logout()">${ic('logout')}<span>خروج</span></button></nav></aside>
- <div class="main"><header class="tb"><span class="mut sm">${isA()?'پنل ادمین':esc(S.server.wg||'wireguard-tools یافت نشد!')}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
+ <div class="main"><header class="tb"><span class="mut sm">${isA()?'پنل ادمین':''}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
  <div class="wrap${TAB=='sta'?' nosta':''}"><h1 class="pt">${cur[1]}</h1><p class="ps">${cur[3]}</p>
  <div class="stats"><div class="st"><span class="si g">${ic('server')}</span><span class="l">اینباند فعال</span><b>${isA()?S.inbounds.length:S.inbounds.filter(i=>i.up).length+' / '+S.inbounds.length}</b></div>
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
