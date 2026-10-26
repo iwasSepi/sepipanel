@@ -38,6 +38,8 @@ AWG_DIR        = "/etc/amnezia/amneziawg"   # اینباندهای AmneziaWG
 DB_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sepipanel.db")
 STATS_INTERVAL = 15                      # ثانیه
 PUBLIC_URL     = ""                      # مثلا https://panel.example.com ؛ خالی = خودکار
+PANEL_VERSION  = "1.0.0"                 # با هر ریلیز جدید در گیت‌هاب این عدد را بالا ببرید (و تگ ریلیز را v1.0.1 بزنید)
+DEFAULT_REPO   = "iwasSepi/sepipanel"
 # ==========================================================================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -2505,11 +2507,68 @@ def tls_files():
     return (c, k) if c and k and os.path.isfile(c) and os.path.isfile(k) else None
 
 
+UPD = {"latest": "", "url": "", "checked": 0, "err": ""}
+PANEL_STARTED = time.time()
+
+
+def _ver_t(v):
+    return tuple(int(n) for n in re.findall(r"\d+", str(v))[:4]) or (0,)
+
+
+def repo_name():
+    try:
+        r = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".repo")).read().split()[0]
+        if re.fullmatch(r"[\w.-]+/[\w.-]+", r):
+            return r
+    except Exception:
+        pass
+    return DEFAULT_REPO
+
+
+def check_update():
+    """آخرین ریلیز گیت‌هاب را می‌خواند (اگر ریلیز نبود، آخرین تگ)."""
+    repo = repo_name()
+    hdr = {"User-Agent": "sepipanel", "Accept": "application/vnd.github+json"}
+    try:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest", headers=hdr), timeout=10) as r:
+                j = json.loads(r.read().decode())
+            tag, url = j.get("tag_name", ""), j.get("html_url", "")
+        except Exception:
+            with urllib.request.urlopen(urllib.request.Request(f"https://api.github.com/repos/{repo}/tags?per_page=1", headers=hdr), timeout=10) as r:
+                j = json.loads(r.read().decode())
+            tag = j[0]["name"] if j else ""
+            url = f"https://github.com/{repo}/releases"
+        if not url.startswith(f"https://github.com/{repo}"):
+            url = f"https://github.com/{repo}/releases"
+        UPD.update(latest=str(tag).lstrip("vV")[:20], url=url, err="")
+    except Exception as e:
+        UPD["err"] = str(e)[:120]
+    UPD["checked"] = int(time.time())
+
+
+def update_loop():
+    time.sleep(20)
+    while True:
+        try:
+            check_update()
+        except Exception:
+            log.exception("update-check")
+        time.sleep(1800)
+
+
+def update_info():
+    lt = UPD["latest"]
+    return dict(current=PANEL_VERSION, latest=lt, url=UPD["url"], checked=UPD["checked"],
+                available=bool(lt) and _ver_t(lt) > _ver_t(PANEL_VERSION), repo=repo_name())
+
+
 def panel_info():
     c = panel_cfg()
     tls = bool(tls_files())
     c.update(tls_on=tls, run_port=RUN["port"], user=admin_user(), default_pass=not setting("admin_hash"),
-             restart_needed=(c["port"] != RUN["port"] or tls != RUN["tls"]), certbot=bool(shutil.which("certbot")))
+             restart_needed=(c["port"] != RUN["port"] or tls != RUN["tls"]), certbot=bool(shutil.which("certbot")),
+             started=int(PANEL_STARTED), upd=update_info())
     return c
 
 
@@ -2706,6 +2765,84 @@ def vless_check_dest():
     if not m:
         raise Err("Dest نامعتبر است (مثال www.microsoft.com:443)")
     return jsonify(check_reality_dest(m.group(1), int(m.group(2) or 443)))
+
+
+REALITY_CANDIDATES = [
+    "www.microsoft.com", "www.apple.com", "www.cloudflare.com", "www.google.com", "www.amazon.com",
+    "www.nvidia.com", "www.intel.com", "www.amd.com", "www.samsung.com", "www.lovelive-anime.jp",
+    "addons.mozilla.org", "www.mozilla.org", "www.python.org", "www.speedtest.net", "www.ebay.com",
+    "www.paypal.com", "www.tesla.com", "www.oracle.com", "www.ibm.com", "www.cisco.com",
+    "www.adobe.com", "www.dell.com", "www.hp.com", "www.asus.com", "www.logitech.com",
+    "www.sony.com", "www.zoom.us", "www.spotify.com", "www.office.com", "www.bing.com",
+    "azure.microsoft.com", "learn.microsoft.com", "support.apple.com", "developer.apple.com",
+    "swdist.apple.com", "icloud.com", "dl.google.com", "cdn.jsdelivr.net", "cdnjs.cloudflare.com",
+    "ajax.googleapis.com", "fonts.googleapis.com", "github.com", "gitlab.com", "stackoverflow.com",
+    "www.wikipedia.org", "www.yahoo.com", "www.linkedin.com", "www.booking.com", "www.airbnb.com",
+    "www.cloudflare-dns.com", "one.one.one.one", "www.docker.com", "www.nginx.com", "www.ubuntu.com",
+    "www.debian.org", "www.oracle.com", "aws.amazon.com", "www.salesforce.com", "www.vmware.com",
+]
+
+
+def _is_public_host(host):
+    """جلوگیری از اسکن آی‌پی‌های داخلی/خصوصی (SSRF)"""
+    try:
+        for fam, _, _, _, sa in socket.getaddrinfo(host, None, type=socket.SOCK_STREAM):
+            ip = ipaddress.ip_address(sa[0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _scan_one(host, port):
+    try:
+        if not _is_public_host(host):
+            return None
+        best = None
+        for _ in range(2):   # بهترین از دو بار تست (پینگ پایدارتر)
+            r = check_reality_dest(host, port, timeout=4)
+            if not r.get("ok"):
+                return None
+            if best is None or r["ms"] < best["ms"]:
+                best = r
+        best["dest"] = f"{host}:{port}"
+        best["host"] = host
+        return best
+    except Exception:
+        return None
+
+
+def scan_reality_dests(items, workers=24):
+    from concurrent.futures import ThreadPoolExecutor
+    seen, targets = set(), []
+    for it in items:
+        m = re.fullmatch(r"([A-Za-z0-9.\-]{1,253})(?::(\d{1,5}))?", str(it).strip().lower())
+        if not m:
+            continue
+        host, port = m.group(1), int(m.group(2) or 443)
+        if not (1 <= port <= 65535) or (host, port) in seen:
+            continue
+        seen.add((host, port)); targets.append((host, port))
+        if len(targets) >= 200:
+            break
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        res = [r for r in ex.map(lambda t: _scan_one(*t), targets) if r]
+    res.sort(key=lambda r: r["ms"])
+    return dict(scanned=len(targets), found=len(res), results=res)
+
+
+@app.post("/api/vless/scan-dests")
+@auth
+def vless_scan_dests():
+    b = body()
+    custom = b.get("domains")
+    if isinstance(custom, str):
+        custom = re.split(r"[\s,;]+", custom)
+    items = [x for x in (custom or []) if str(x).strip()] or REALITY_CANDIDATES
+    out = scan_reality_dests(items)
+    out["results"] = out["results"][:40]
+    return jsonify(out)
 
 
 @app.get("/api/vless/keys")
@@ -4099,6 +4236,13 @@ def state_admin():
                    panel=dict(user=a["username"]), server=dict(qr=bool(qrcode), now=now(), base=base_url()))
 
 
+@app.post("/api/update/check")
+@auth
+def update_check_api():
+    check_update()
+    return jsonify(update_info(), err=UPD["err"])
+
+
 @app.get("/api/state")
 @auth_any
 def state():
@@ -5441,6 +5585,17 @@ svg.ic{width:1em;height:1em;flex:none;stroke:currentColor;fill:none;stroke-width
 .usr small i{width:7px;height:7px;border-radius:50%;background:var(--ok)}
 .av{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#1e3a6e,#2563eb);display:grid;place-items:center;font-size:20px;color:#dbe7ff}
 .sm{font-size:12px}
+.sbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-width:0}
+.sp{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 13px;border-radius:999px;border:0;font:inherit;font-size:12.5px;color:var(--ink);background:linear-gradient(var(--card),var(--card)) padding-box,linear-gradient(135deg,rgba(37,99,235,.7),rgba(168,85,247,.55)) border-box;border:1px solid transparent;cursor:pointer;white-space:nowrap}
+.sp b{font-weight:700;letter-spacing:.3px}.sp em{font-style:normal;direction:ltr;font-size:11.5px;color:var(--mut);background:rgba(255,255,255,.06);padding:1px 7px;border-radius:999px}
+.sp .dot{width:8px;height:8px;border-radius:50%;background:var(--off);flex:none}
+.sp.ok .dot{background:var(--ok);box-shadow:0 0 0 0 rgba(34,197,94,.6);animation:pls 2s infinite}.sp.wr .dot{background:var(--warn)}.sp.bd .dot{background:var(--bad)}
+.sp.sm2{cursor:default}.sp .ic{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+.sp.upd{color:#fde68a;background:linear-gradient(rgba(245,158,11,.14),rgba(245,158,11,.14)) padding-box,linear-gradient(135deg,#f59e0b,#ef4444) border-box;animation:nudge 2.6s ease-in-out infinite}.sp.upd em{color:#fde68a;background:rgba(245,158,11,.2)}
+@keyframes pls{70%{box-shadow:0 0 0 7px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+@keyframes nudge{50%{transform:translateY(-2px)}}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:8px 18px;margin:10px 0;font-size:13.5px}.kv span{color:var(--mut)}
+.updnote{margin:12px 0 6px}pre.cmd{background:var(--field);border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:6px 0 12px;user-select:all}
 .wrap{max-width:1080px;margin:0 auto;padding:30px 24px 50px}
 h1.pt{margin:0 0 2px;font-size:26px;line-height:1.5}p.ps{margin:0 0 24px;color:var(--mut);font-size:13.5px}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:16px;margin-bottom:22px}
@@ -5494,6 +5649,12 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
 .md{background:var(--card);border:1px solid var(--line);border-radius:16px;max-width:660px;width:100%;padding:20px 22px;box-shadow:0 24px 60px rgba(0,0,0,.5)}
 .md h2{margin:0 0 14px;font-size:18px}.md h4{margin:18px 0 8px;color:#60a5fa;font-size:14px;border-bottom:1px solid var(--line);padding-bottom:5px}
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+.tabs{display:flex;gap:4px;overflow-x:auto;border-bottom:1px solid var(--line);margin-bottom:14px;position:sticky;top:0;background:var(--card);padding-top:4px;z-index:2;scrollbar-width:thin}
+.tb{background:none;border:0;border-bottom:2px solid transparent;color:var(--mut);padding:9px 14px;font:inherit;font-size:13.5px;cursor:pointer;white-space:nowrap}
+.tb.on{color:#60a5fa;border-bottom-color:#60a5fa}.tp[hidden]{display:none}
+.scan .srow{margin:8px 0}.scan .mut{color:var(--mut);font-size:12.5px;margin:6px 0}.scan h4{margin-top:4px}
+.sr{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.sr .d{direction:ltr;text-align:left;flex:1;min-width:150px;font-family:ui-monospace,Consolas,monospace;font-size:13px}.sr .ms{color:#34d399;font-weight:600;min-width:56px;direction:ltr}
 #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:20;display:flex;flex-direction:column;gap:6px;align-items:center}
 #toast div{background:#1a2742;border:1px solid #2a3b5e;color:#fff;padding:9px 16px;border-radius:10px;max-width:90vw;box-shadow:0 8px 24px rgba(0,0,0,.4)}#toast div.e{background:#3a1519;border-color:#7f1d1d}
 .login{max-width:360px;margin:12vh auto;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:26px;box-shadow:0 24px 60px rgba(0,0,0,.4)}
@@ -5535,7 +5696,7 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
 @media(max-width:860px){
  .shell{grid-template-columns:1fr}.side{position:static;height:auto;border-inline-end:0;border-bottom:1px solid var(--line)}
  .brand{height:56px}.nav{flex-direction:row;overflow-x:auto;padding:8px 10px}.nav button{white-space:nowrap;padding:9px 13px}
- .tb{height:56px;padding:0 14px}.wrap{padding:20px 14px 40px}h1.pt{font-size:22px}}
+ .tb{height:56px;padding:0 14px}.sp{height:28px;padding:0 10px;font-size:11.5px}.sp.sm2{display:none}.sp.upd span{max-width:110px;overflow:hidden;text-overflow:ellipsis}.wrap{padding:20px 14px 40px}h1.pt{font-size:22px}}
 @media(max-width:520px){.g2{grid-template-columns:1fr}}
 .dk h3{margin:24px 0 8px;font-size:16px}.dk p,.dk li{line-height:1.9;font-size:14px}.dk ol,.dk ul{padding-right:22px;margin:6px 0}
 .dk code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}.dk p code,.dk li code,.dk td code{background:rgba(130,160,255,.13);padding:1px 6px;border-radius:5px;direction:ltr;unicode-bidi:embed}
@@ -5587,12 +5748,25 @@ NAV.push(['tun','تانل','tun','ساخت و مدیریت تانل BackPack ب�
 NAV.push(['api','API و مستندات','api','اتصال پنل به ربات تلگرام یا سایت برای فروش خودکار: کلید API بسازید و طبق مستندات زیر کلاینت بسازید، تمدید کنید و لینک اشتراک را تحویل بدهید.']);
 const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.'],['api','API و مستندات','api','کلید API خودتان را بسازید، سقف حجم و زمانش را کم و زیاد کنید و ربات یا سایتتان را وصل کنید؛ مصرف فقط از کلاینت‌هایی که با همان کلید ساخته می‌شوند کم می‌شود.']];
 const isA=()=>S&&S.role==='admin';
+function fmtUp(sec){sec=Math.max(0,sec|0);const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);return d?d+'d '+h+'h':h?h+'h '+m+'m':m+'m'}
+function statusBar(){const u=(S.panel&&S.panel.upd)||{},vl=S.inbounds.filter(i=>i.proto==='vless'),vu=vl.filter(i=>i.up).length;
+ const up=S.panel&&S.panel.started?fmtUp(Date.now()/1000-S.panel.started):'';
+ let h=`<button class="sp ok" onclick="statusModal()" title="وضعیت پنل"><i class="dot"></i><b>Sepi</b><span>در حال اجرا</span><em>v${esc(u.current||'')}</em></button>`;
+ if(vl.length)h+=`<span class="sp ${vu==vl.length?'ok':vu?'wr':'bd'} sm2"><i class="dot"></i><b>VLESS</b><em>${vu}/${vl.length}</em></span>`;
+ if(u.available)h+=`<button class="sp upd" onclick="statusModal()" title="نسخهٔ جدید در گیت‌هاب"><svg class="ic" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7"/></svg><span>پنل نیاز به آپدیت دارد</span><em>v${esc(u.latest)}</em></button>`;
+ return h}
+function statusModal(){const u=S.panel.upd||{};
+ const m=modal(`<h2>وضعیت پنل</h2><div class="kv"><span>نسخهٔ نصب‌شده</span><b dir="ltr">v${esc(u.current)}</b><span>آخرین نسخهٔ گیت‌هاب</span><b dir="ltr">${u.latest?'v'+esc(u.latest):'—'}</b><span>زمان فعالیت</span><b dir="ltr">${fmtUp(Date.now()/1000-S.panel.started)}</b></div>
+ ${u.available?`<p class="updnote">نسخهٔ جدید منتشر شده. برای آپدیت در ترمینال سرور بزنید (دیتابیس و رمز حفظ می‌شود):</p><pre class="cmd" dir="ltr">sepipanel update</pre>${u.url?`<a class="s" style="display:inline-block;text-decoration:none;padding:8px 14px" href="${esc(u.url)}" target="_blank" rel="noopener">مشاهدهٔ ریلیز در گیت‌هاب</a>`:''}`:'<p class="mut">پنل شما آخرین نسخه است ✔</p>'}
+ <div class="mfoot"><button class="s" id="mc">بستن</button><button class="p" id="mk">بررسی دوباره</button></div>`);
+ m.querySelector('#mc').onclick=()=>m.remove();
+ m.querySelector('#mk').onclick=async()=>{try{S.panel.upd=await api('/update/check','POST');m.remove();render();statusModal()}catch(e){toast(e.message,1)}}}
 function render(){
  const NV=isA()?NAV_A:NAV;if(!NV.find(n=>n[0]==TAB))TAB='cli';
  const on=S.clients.filter(c=>c.online).length,tot=S.clients.reduce((a,c)=>a+c.up_bytes+c.down_bytes,0),cur=NV.find(n=>n[0]==TAB);
  $('#app').innerHTML=`<div class="shell"><aside class="side"><div class="brand"><span class="lg">${ic('shield')}</span><div><b>SepiPanel</b><small>پنل مدیریت</small></div></div>
  <nav class="nav">${NV.map(([k,l,i])=>`<button class="${TAB==k?'on':''}" onclick="TAB='${k}';render()">${ic(i)}<span>${l}</span></button>`).join('')}<button onclick="logout()">${ic('logout')}<span>خروج</span></button></nav></aside>
- <div class="main"><header class="tb"><span class="mut sm">${isA()?'پنل ادمین':''}</span><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
+ <div class="main"><header class="tb"><div class="sbar">${statusBar()}</div><div class="usr"><span class="av">${ic('user')}</span><div><b>${esc(S.panel.user)}</b><small><i></i>آنلاین</small></div></div></header>
  <div class="wrap${TAB=='sta'?' nosta':''}"><h1 class="pt">${cur[1]}</h1><p class="ps">${cur[3]}</p>
  <div class="stats"><div class="st"><span class="si g">${ic('server')}</span><span class="l">اینباند فعال</span><b>${isA()?S.inbounds.length:S.inbounds.filter(i=>i.up).length+' / '+S.inbounds.length}</b></div>
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
@@ -5728,15 +5902,31 @@ const OBF=[['jc','Jc (تعداد بسته‌های junk)','پیشنهادی ۴ �
  ['hpk','HeaderProtectionKey','کلید base64 ۳۲ بایتی؛ روی سرور و کلاینت باید یکی باشد؛ خالی = خاموش'],['cpa','ContentPaddingAddition','عدد یا بازه، مثلا 13-28'],
  ['rekey_after','RekeyAfterTime (ثانیه)','مثلا 101-114'],['rekey_timeout','RekeyTimeout (ثانیه)','مثلا 3-6'],['reject_after','RejectAfterTime (ثانیه)','مثلا 166-241'],
  ['keepalive_timeout','KeepaliveTimeout (ثانیه)','مثلا 12-20'],['max_hs','MaxHandshakeAttempts','مثلا 15-21']];
-const AWG_FIELDS=[{s:'مبهم‌سازی AmneziaWG (ضد DPI)',p:'wg'},
+const AWG_FIELDS=[{s:'مبهم‌سازی AmneziaWG (ضد DPI)',tab:'AmneziaWG',p:'wg'},
  {p:'wg',k:'obf_enabled',l:'فعال‌سازی AmneziaWG برای این اینباند',t:'check',h:'سرور باید amneziawg-tools نصب داشته باشد و کلاینت‌ها اپ AmneziaWG بزنند؛ اپ WireGuard معمولی به این اینباند وصل نمی‌شود.'},
  {p:'wg',k:'obf_ver',l:'نسخه پارامترها برای ساخت خودکار',t:'select',opts:[['3','3.x — کامل (Header Protection + padding + تایمرها)'],['2','2.0 — S3/S4 + بازه H + I1'],['1','1.x — فقط Jc/Jmin/Jmax/S1/S2/H1-H4']]},
  {p:'wg',t:'btn',l:'ساخت دوباره پارامترها',on:'genObf()'},
  ...OBF.map(([k,l,h])=>({k:'o_'+k,l,h,p:'wg'}))];
+const SCAN_HTML=`<div class="scan"><h4>اسکن دامنهٔ مناسب Reality</h4>
+<small>از روی همین سرور، دامنه‌های دارای TLS 1.3 و h2 را تست می‌کند و کم‌پینگ‌ترین‌ها را نشان می‌دهد.</small>
+<div class="srow"><button type="button" class="s" onclick="scanDests(0)">اسکن لیست پیشنهادی</button></div>
+<div class="fg"><label>اسکن دامنه‌های دلخواه (هر خط یکی یا با کاما)</label><textarea id="scan_custom" spellcheck="false" style="min-height:70px;direction:ltr;text-align:left" placeholder="example.com&#10;www.example.org:443"></textarea></div>
+<div class="srow"><button type="button" class="s" onclick="scanDests(1)">اسکن دامنه‌های دلخواه</button></div>
+<div id="scan_out"></div></div>`;
+let SCANNING=false;
+async function scanDests(custom){if(SCANNING)return;const out=$('#scan_out');let body={};
+ if(custom){const v=($('#scan_custom').value||'').trim();if(!v){toast('دامنه‌ای وارد نشده',1);return}body={domains:v}}
+ SCANNING=true;out.innerHTML='<div class="mut">در حال اسکن… (ممکن است تا چند ده ثانیه طول بکشد)</div>';
+ try{const r=await api('/vless/scan-dests','POST',body);
+  if(!r.results.length){out.innerHTML=`<div class="mut">از ${r.scanned} دامنه، هیچ‌کدام مناسب Reality نبود.</div>`;return}
+  out.innerHTML=`<div class="mut">${r.found} مناسب از ${r.scanned} دامنه — مرتب‌شده بر اساس کمترین پینگ</div>`+r.results.map(x=>`<div class="sr"><span class="d">${esc(x.dest)}</span><span class="ms">${x.ms}ms</span><span class="mut">${esc(x.tls)} · ${esc(x.alpn)}</span><button type="button" class="p" data-dest="${esc(x.dest)}" data-host="${esc(x.host)}">استفاده</button></div>`).join('');
+  out.querySelectorAll('button[data-dest]').forEach(b=>b.onclick=()=>useDest(b.dataset.dest,b.dataset.host))
+ }catch(e){out.innerHTML='';toast(e.message,1)}finally{SCANNING=false}}
+function useDest(d,h){const a=$('#f_x_reality_dest'),s=$('#f_x_server_names');if(a)a.value=d;if(s)s.value=h;toast('Dest و SNI تنظیم شد: '+d)}
 async function testDest(){try{const d=$('#f_x_reality_dest').value||'www.microsoft.com:443';toast('در حال تست…');const r=await api('/vless/check-dest?dest='+encodeURIComponent(d));toast(r.ok?`✔ ${r.tls} · ${r.alpn} · ${r.ms}ms — ${r.note}`:(r.error||`✘ ${r.tls||''} ${r.alpn||''} — ${r.note||''}`),!r.ok)}catch(e){toast(e.message,1)}}
 async function genObf(){try{const r=await api('/obf/generate?v='+$('#f_obf_ver').value);for(const [k] of OBF){const e=$('#f_o_'+k);if(e)e.value=r[k]||''}$('#f_obf_enabled').checked=true;toast('پارامترهای جدید ساخته شد')}catch(e){toast(e.message,1)}}
 const XFP=['chrome','firefox','safari','ios','android','edge','360','qq','random','randomized',''];
-const INB=[{s:'اصلی'},
+const INB=[{s:'اصلی',tab:'پایه'},
  {k:'proto',l:'پروتکل',t:'select',opts:[['wg','WireGuard'],['l2tp','L2TP/IPsec — برای مودم، روتر و گوشی (بدون نیاز به اپ)'],['ovpn','OpenVPN — اپ OpenVPN، مودم و روتر (UDP/TCP)'],['vless','VLESS — Xray (Reality / TLS / WS / gRPC / xHTTP / mKCP)']],lock:1,h:'پروتکل بعد از ساخت اینباند قابل تغییر نیست. از L2TP فقط یک اینباند می‌شود ساخت.'},
  {k:'node_id',l:'نود (سروری که این اینباند روی آن ساخته می‌شود)',t:'select',p:'vless',lock:1,opts:()=>[['0','این سرور (پنل اصلی)'],...(S.nodes||[]).map(n=>[String(n.id),esc(n.name)+' — '+esc(n.address)])],h:'بعد از ساخت قابل تغییر نیست. روی نود، گواهی «پنل» عیناً به نود کپی می‌شود و مسیر «فایل گواهی» باید روی خود نود باشد. لینک کلاینت‌ها به آدرس همان نود می‌رود.'},
  {k:'name',l:'نام اینباند',h:'مثل wg0 یا l2tp — حداکثر ۱۵ حرف انگلیسی'},{k:'remark',l:'توضیح',rtl:1},
@@ -5745,7 +5935,7 @@ const INB=[{s:'اصلی'},
  {k:'address6',l:'آدرس سرور IPv6 (اختیاری)',ph:'fd42:42:0::1/64',h:'خالی = بدون IPv6',p:'wg'},
  {k:'private_key',l:'کلید خصوصی سرور',h:'خالی = ساخت خودکار (در ویرایش: خالی = بدون تغییر)',p:'wg'},
  {k:'regen_keys',l:'ساخت دوباره کلید سرور / CA (کلاینت‌ها باید کانفیگ جدید بگیرند)',t:'check',edit:1,p:'wg ovpn vless'},
- {s:'اتصال کلاینت‌ها'},
+ {s:'اتصال کلاینت‌ها',tab:'اتصال'},
  {k:'endpoint',l:'آدرس عمومی سرور (Endpoint)',h:'IP یا دامنه. خالی = همان آدرسی که پنل با آن باز شده'},
  {k:'endpoint_port',l:'پورت Endpoint',t:'number',h:'۰ = همان پورت listen (برای پورت‌فوروارد/NAT/CDN). در VLESS: پورتی که داخل لینک کلاینت می‌آید',p:'wg ovpn vless'},
  {k:'dns',l:'DNS کلاینت',ph:'1.1.1.1, 1.0.0.1',p:'wg l2tp ovpn'},{k:'client_mtu',l:'MTU کلاینت',t:'number',h:'۰ = همان MTU سرور',p:'wg'},
@@ -5753,7 +5943,7 @@ const INB=[{s:'اصلی'},
  {k:'client_keepalive',l:'PersistentKeepalive (ثانیه)',t:'number',h:'۰ = خاموش، ۲۵ = پیشنهادی پشت NAT',p:'wg'},
  {k:'use_psk',l:'PresharedKey جداگانه برای هر کلاینت (امنیت بیشتر)',t:'check',p:'wg'},
  {k:'exclude_sub',l:'حذف از اشتراک‌ها (کلاینت‌ها این اینباند را در لینک ساب نمی‌بینند)',t:'check'},
- {s:'تنظیمات OpenVPN',p:'ovpn'},
+ {s:'تنظیمات OpenVPN',tab:'OpenVPN',p:'ovpn'},
  {k:'v_transport',l:'ترنسپورت',t:'select',p:'ovpn',opts:[['udp','UDP — سریع‌تر (پیشنهادی)'],['tcp','TCP — برای شبکه‌های محدود، مثلاً پورت 443']]},
  {k:'v_cipher',l:'رمزنگاری دیتا',t:'select',p:'ovpn',opts:[['AES-256-GCM','AES-256-GCM (پیشنهادی)'],['AES-128-GCM','AES-128-GCM'],['CHACHA20-POLY1305','CHACHA20-POLY1305 (موبایل/مودم بدون AES سخت‌افزاری)'],['AES-256-CBC','AES-256-CBC (قدیمی)'],['AES-128-CBC','AES-128-CBC (قدیمی)']]},
  {k:'v_keytype',l:'نوع کلید گواهی‌ها',t:'select',p:'ovpn',opts:[['ec','EC prime256v1 — سبک و سریع'],['rsa','RSA 2048 — سازگار با دستگاه‌های قدیمی']],h:'روی اینباند موجود فقط با «ساخت دوباره کلید» اعمال می‌شود.'},
@@ -5763,20 +5953,21 @@ const INB=[{s:'اصلی'},
  {k:'v_legacy',l:'سازگاری با کلاینت‌های قدیمی (OpenVPN 2.3 و مودم‌های قدیمی: ncp-ciphers)',t:'check',p:'ovpn'},
  {k:'v_extra_server',l:'دستورات اضافه سرور (هر خط یک دستور)',t:'textarea',p:'ovpn',h:'دستورات خطرناک مثل script-security/up/plugin مسدودند.'},
  {k:'v_extra_client',l:'دستورات اضافه کلاینت (هر خط یک دستور)',t:'textarea',p:'ovpn',h:'مثلاً: compress / tun-mtu / http-proxy'},
- {s:'تنظیمات VLESS (Xray-core)',p:'vless'},
+ {s:'تنظیمات VLESS (Xray-core)',tab:'VLESS',p:'vless'},
  {k:'x_transport',l:'ترنسپورت (Network)',t:'select',p:'vless',opts:[['tcp','TCP (RAW) — با Reality/Vision بهترین حالت'],['ws','WebSocket — پشت CDN'],['grpc','gRPC'],['httpupgrade','HTTPUpgrade'],['xhttp','xHTTP (SplitHTTP) — جدیدترین'],['kcp','mKCP (UDP)']]},
  {k:'x_security',l:'امنیت (Security)',t:'select',p:'vless',opts:[['reality','Reality — بدون نیاز به دامنه و گواهی (پیشنهادی)'],['tls','TLS — با دامنه و گواهی'],['none','بدون رمزنگاری (فقط پشت CDN/پروکسی)']],h:'Reality فقط با TCP، gRPC و xHTTP کار می‌کند؛ mKCP فقط بدون امنیت.'},
  {k:'x_flow',l:'Flow',t:'select',p:'vless',w:'x_transport=tcp,x_security=tls|reality',opts:[['xtls-rprx-vision','xtls-rprx-vision (پیشنهادی)'],['','بدون flow']]},
  {k:'x_fp',l:'Fingerprint کلاینت (uTLS)',t:'select',p:'vless',w:'x_security=tls|reality',opts:XFP.map(a=>[a,a||'بدون'])},
  {k:'x_packet_encoding',l:'Packet Encoding',t:'select',p:'vless',opts:[['','پیش‌فرض'],['xudp','xudp (پیشنهادی برای UDP/بازی)'],['packet','packet']]},
- {s:'Reality',p:'vless',w:'x_security=reality'},
+ {s:'Reality',tab:'Reality',p:'vless',w:'x_security=reality'},
  {k:'x_reality_dest',l:'Dest (سایت مقصد برای Reality)',p:'vless',w:'x_security=reality',ph:'www.microsoft.com:443',h:'سایتی که TLS 1.3 و h2 داشته باشد و در کشور شما فیلتر نباشد.'},
  {t:'btn',l:'تست Dest (TLS1.3 / h2)',on:'testDest()',p:'vless',w:'x_security=reality'},
+ {t:'html',p:'vless',w:'x_security=reality',html:SCAN_HTML},
  {k:'x_server_names',l:'SNI ها (serverNames، با کاما)',p:'vless',w:'x_security=reality',ph:'www.microsoft.com',h:'خالی = همان دامین Dest. اولین مورد در لینک کلاینت می‌آید.'},
  {k:'x_short_ids',l:'Short IDها (با کاما)',p:'vless',w:'x_security=reality',h:'خالی = ساخت خودکار. hex زوج، ۲ تا ۱۶ کاراکتر.'},
  {k:'x_spider_x',l:'SpiderX',p:'vless',w:'x_security=reality',ph:'/'},
  {k:'x_reality_priv',l:'کلید خصوصی Reality (اختیاری)',p:'vless',w:'x_security=reality',h:'خالی = ساخت خودکار / بدون تغییر. کلید عمومی در کارت اینباند نمایش داده می‌شود.'},
- {s:'TLS',p:'vless',w:'x_security=tls'},
+ {s:'TLS',tab:'TLS',p:'vless',w:'x_security=tls'},
  {k:'x_tls_mode',l:'منبع گواهی',t:'select',p:'vless',w:'x_security=tls',opts:[['panel','گواهی پنل (دامنهٔ ثبت‌شده در sepipanel)'],['files','فایل‌های گواهی روی سرور'],['self','خودامضا (برای تست/پشت CDN)']]},
  {k:'x_tls_cert',l:'مسیر fullchain.pem',p:'vless',w:'x_security=tls,x_tls_mode=files',ph:'/etc/letsencrypt/live/example.com/fullchain.pem'},
  {k:'x_tls_key',l:'مسیر privkey.pem',p:'vless',w:'x_security=tls,x_tls_mode=files',ph:'/etc/letsencrypt/live/example.com/privkey.pem'},
@@ -5785,7 +5976,7 @@ const INB=[{s:'اصلی'},
  {k:'x_min_ver',l:'حداقل نسخه TLS',t:'select',p:'vless',w:'x_security=tls',opts:[['1.2','1.2'],['1.3','1.3'],['1.1','1.1'],['1.0','1.0']]},
  {k:'x_reject_sni',l:'رد SNI ناشناخته (rejectUnknownSni)',t:'check',p:'vless',w:'x_security=tls'},
  {k:'x_allow_insecure',l:'کلاینت اعتبارسنجی گواهی را رد کند (allowInsecure)',t:'check',p:'vless',w:'x_security=tls'},
- {s:'جزئیات ترنسپورت',p:'vless'},
+ {s:'جزئیات ترنسپورت',tab:'ترنسپورت',p:'vless'},
  {k:'x_tcp_header',l:'Header TCP',t:'select',p:'vless',w:'x_transport=tcp',opts:[['none','none'],['http','http (استتار HTTP)']]},
  {k:'x_path',l:'Path',p:'vless',w:'x_transport=ws|httpupgrade|xhttp|tcp',ph:'/'},
  {k:'x_host',l:'Host',p:'vless',w:'x_transport=ws|httpupgrade|xhttp|tcp',h:'برای WS/CDN معمولاً همان دامنه'},
@@ -5795,7 +5986,7 @@ const INB=[{s:'اصلی'},
  {k:'x_multi_mode',l:'Multi Mode (gRPC)',t:'check',p:'vless',w:'x_transport=grpc'},
  {k:'x_kcp_header',l:'Header mKCP',t:'select',p:'vless',w:'x_transport=kcp',opts:[['none','none'],['srtp','srtp'],['utp','utp'],['wechat-video','wechat-video'],['dtls','dtls'],['wireguard','wireguard']]},
  {k:'x_kcp_seed',l:'Seed (mKCP)',p:'vless',w:'x_transport=kcp'},
- {s:'Fallback، Sniffing و مسیریابی',p:'vless'},
+ {s:'Fallback، Sniffing و مسیریابی',tab:'Sniffing و مسیر',p:'vless'},
  {k:'x_fallback_dest',l:'Fallback Dest (فقط TCP + TLS)',p:'vless',w:'x_transport=tcp,x_security=tls',ph:'80 یا 127.0.0.1:8080',h:'درخواست‌های غیر VLESS به این مقصد می‌روند (مثلاً یک وب‌سایت).'},
  {k:'x_fallback_xver',l:'Fallback xver (PROXY protocol)',t:'number',p:'vless',w:'x_transport=tcp,x_security=tls'},
  {k:'x_sniffing',l:'Sniffing (تشخیص http/tls/quic)',t:'check',p:'vless'},
@@ -5806,7 +5997,7 @@ const INB=[{s:'اصلی'},
  {k:'x_listen',l:'Listen',p:'vless',ph:'0.0.0.0',h:'برای IPv6 هم: ::'},
  {k:'x_tfo',l:'TCP Fast Open',t:'check',p:'vless'},
  {k:'x_extra_stream',l:'JSON اضافه برای streamSettings (پیشرفته)',t:'textarea',p:'vless',h:'مثلاً {"sockopt":{"tcpKeepAliveIdle":300}} — با تنظیمات بالا ادغام می‌شود.'},
- {s:'پیشرفته (سرور)'},
+ {s:'پیشرفته (سرور)',tab:'پیشرفته'},
 
  {k:'mtu',l:'MTU اینترفیس سرور',t:'number',p:'wg l2tp ovpn',h:'۰ = پیش‌فرض (وایرگارد 1420، L2TP ‏1400، OpenVPN خودکار)'},
  {k:'table_',l:'Table',ph:'off | auto | عدد',h:'خالی = پیش‌فرض wg-quick',p:'wg'},{k:'fwmark',l:'FwMark',ph:'0xca6c | off',p:'wg'},
@@ -5817,17 +6008,25 @@ const INB=[{s:'اصلی'},
  ...AWG_FIELDS];
 function fieldHTML(f,v,edit){const h=fieldInner(f,v,edit);return (f.p||f.w)&&h?`<div ${f.p?`data-p="${f.p}"`:''} ${f.w?`data-w="${f.w}"`:''}>${h}</div>`:h}
 function fieldInner(f,v,edit){
- if(f.s)return `<h4>${f.s}</h4>`;if(f.edit&&!edit)return '';if(f.t==='btn')return `<div class="fg"><button type="button" class="s" onclick="${f.on}">${f.l}</button></div>`;
+ if(f.s)return `<h4>${f.s}</h4>`;if(f.edit&&!edit)return '';if(f.t==='html')return f.html;if(f.t==='btn')return `<div class="fg"><button type="button" class="s" onclick="${f.on}">${f.l}</button></div>`;
  let val=v[f.k];if(val==null)val='';const id='f_'+f.k;const h=f.h?`<small>${f.h}</small>`:'';
  if(f.t==='check')return `<div class="fg"><label class="chk"><input type="checkbox" id="${id}" ${val?'checked':''}> ${f.l}</label>${h}</div>`;
  if(f.t==='select')return `<div class="fg"><label>${f.l}</label><select id="${id}" ${f.lock&&edit?'disabled':''}>${(typeof f.opts==='function'?f.opts():f.opts).map(([a,b])=>`<option value="${a}" ${String(val)===a?'selected':''}>${b}</option>`).join('')}</select>${h}</div>`;
  if(f.t==='textarea')return `<div class="fg"><label>${f.l}</label><textarea id="${id}" spellcheck="false">${esc(val)}</textarea>${h}</div>`;
  return `<div class="fg"><label>${f.l}</label><input id="${id}" type="${f.t==='number'?'number':f.t||'text'}" value="${esc(val)}" placeholder="${esc(f.ph||'')}" ${f.rtl?'style="direction:rtl;text-align:right"':''}>${h}</div>`}
-function collect(fields,edit){const o={};for(const f of fields){if(f.s||f.t==='btn'||(f.edit&&!edit))continue;const e=$('#f_'+f.k);const v=f.t==='check'?e.checked:e.value;if(f.k.startsWith('o_')){(o.obf=o.obf||{})[f.k.slice(2)]=v}else if(f.k.startsWith('v_')){(o.ovpn=o.ovpn||{})[f.k.slice(2)]=v}else if(f.k.startsWith('x_')){(o.xcfg=o.xcfg||{})[f.k.slice(2)]=v}else o[f.k]=v}return o}
+function collect(fields,edit){const o={};for(const f of fields){if(f.s||f.t==='btn'||f.t==='html'||(f.edit&&!edit))continue;const e=$('#f_'+f.k);const v=f.t==='check'?e.checked:e.value;if(f.k.startsWith('o_')){(o.obf=o.obf||{})[f.k.slice(2)]=v}else if(f.k.startsWith('v_')){(o.ovpn=o.ovpn||{})[f.k.slice(2)]=v}else if(f.k.startsWith('x_')){(o.xcfg=o.xcfg||{})[f.k.slice(2)]=v}else o[f.k]=v}return o}
 function modal(html){const m=document.createElement('div');m.className='ov';m.innerHTML=`<div class="md">${html}</div>`;m.addEventListener('mousedown',e=>{if(e.target===m)m.remove()});document.body.appendChild(m);return m}
+function tabbedHTML(fields,vals,edit){
+ if(!fields.some(f=>f.s))return fields.map(f=>fieldHTML(f,vals,edit)).join('');
+ const G=[];for(const f of fields){if(f.s)G.push({h:f,fs:[]});else if(G.length)G[G.length-1].fs.push(f);else G.push({h:{s:'اصلی'},fs:[f]})}
+ const bar=G.map((g,i)=>`<button type="button" class="tb${i?'':' on'}" data-t="${i}" ${g.h.p?`data-p="${g.h.p}"`:''} ${g.h.w?`data-w="${g.h.w}"`:''}>${g.h.tab||g.h.s}</button>`).join('');
+ return `<div class="tabs">${bar}</div>`+G.map((g,i)=>`<div class="tp" data-t="${i}" ${i?'hidden':''}>${g.fs.map(f=>fieldHTML(f,vals,edit)).join('')}</div>`).join('')}
+function showTab(m,i){m.querySelectorAll('.tb').forEach(b=>b.classList.toggle('on',b.dataset.t==i));m.querySelectorAll('.tp').forEach(p=>p.hidden=p.dataset.t!=i)}
 function formModal(title,fields,vals,edit,onSave){
- const m=modal(`<h2>${title}</h2>${fields.map(f=>fieldHTML(f,vals,edit)).join('')}<div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">${ic('save')}ذخیره</button></div>`);
+ const m=modal(`<h2>${title}</h2>${tabbedHTML(fields,vals,edit)}<div class="mfoot"><button class="s" id="mc">انصراف</button><button class="p" id="ms">${ic('save')}ذخیره</button></div>`);
  m.querySelector('#mc').onclick=()=>m.remove();
+ m.querySelectorAll('.tb').forEach(b=>b.onclick=()=>showTab(m,b.dataset.t));
+ const fixTab=()=>{const on=m.querySelector('.tb.on');if(on&&on.style.display==='none'){const f=[...m.querySelectorAll('.tb')].find(b=>b.style.display!=='none');if(f)showTab(m,f.dataset.t)}};
  const ps=m.querySelector('#f_proto');
  if(ps){const g=k=>m.querySelector('#f_'+k);const w={port:g('port')&&g('port').value,mtu:g('mtu')&&g('mtu').value};
    const DM={wg:{name:g('name')&&g('name').value,port:w.port,mtu:w.mtu},l2tp:{name:'l2tp',mtu:'1400'},ovpn:{name:'ovpn',port:'1194',mtu:'0'},vless:{name:'vless',port:'443'}};
@@ -5835,7 +6034,7 @@ function formModal(title,fields,vals,edit,onSave){
    const okW=w=>!w||w.split(',').every(c=>{const [k,vs]=c.split('=');return vs.split('|').includes(val(k))});
    const ap=()=>{m.querySelectorAll('[data-p],[data-w]').forEach(e=>e.style.display=((!e.dataset.p||e.dataset.p.split(' ').includes(ps.value))&&okW(e.dataset.w))?'':'none');
      if(!edit){const d=DM[ps.value];for(const k of ['name','port','mtu']){const e=g(k);if(e&&d[k]!=null&&(k!=='name'||/^(wg\d*|l2tp|ovpn|vless)$/.test(e.value)))e.value=d[k]}}};
-   ps.onchange=ap;m.addEventListener('change',ap);ap()}
+   const ap2=()=>{ap();fixTab()};ps.onchange=ap2;m.addEventListener('change',ap2);ap2()}
  m.querySelector('#ms').onclick=async()=>{if(await onSave(collect(fields,edit)))m.remove()}}
 function newInb(pre={}){const d=S.defaults;formModal('اینباند جدید',INB,{...d,obf_ver:'3',proto:'wg',...Object.fromEntries(Object.entries(d.ovpn||{}).map(([k,v])=>['v_'+k,v])),...Object.fromEntries(Object.entries(d.xcfg||{}).map(([k,v])=>['x_'+k,v])),...pre},false,o=>act(()=>api('/inbounds','POST',o),'اینباند ساخته شد'))}
 function editInb(id){const i=S.inbounds.find(x=>x.id==id);formModal('ویرایش اینباند '+esc(i.name),INB,{...i,private_key:'',obf_ver:'3',...Object.fromEntries(Object.entries(i.obf||{}).map(([k,v])=>['o_'+k,v])),...Object.fromEntries(Object.entries(i.ovpn||{}).map(([k,v])=>['v_'+k,v])),...Object.fromEntries(Object.entries(i.xcfg||{}).map(([k,v])=>['x_'+k,v])),x_reality_priv:''},true,o=>act(()=>api('/inbounds/'+id,'PUT',o),'ذخیره شد'))}
@@ -6155,6 +6354,7 @@ def main():
     threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=sys_loop, daemon=True).start()
     threading.Thread(target=node_loop, daemon=True).start()
+    threading.Thread(target=update_loop, daemon=True).start()
     log.info("SepiPanel روی %s://%s:%s/%s", "https" if tls else "http", PANEL_HOST, c["port"], c["path"])
     app.run(host=PANEL_HOST, port=c["port"], threaded=True, ssl_context=tls)
 
