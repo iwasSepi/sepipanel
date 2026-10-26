@@ -149,7 +149,16 @@ ensure_cols("inbounds", {"obf": "TEXT DEFAULT ''", "exclude_sub": "INTEGER DEFAU
 ensure_cols("client_inbound", {"l2tp_user": "TEXT DEFAULT ''", "l2tp_pass": "TEXT DEFAULT ''",
                                "ovpn_cn": "TEXT DEFAULT ''", "ovpn_crt": "TEXT DEFAULT ''", "ovpn_key": "TEXT DEFAULT ''",
                                "vuuid": "TEXT DEFAULT ''"})
-ensure_cols("clients", {"reset_period": "TEXT DEFAULT ''", "last_reset": "INTEGER DEFAULT 0", "owner_id": "INTEGER DEFAULT 0"})
+ensure_cols("clients", {"reset_period": "TEXT DEFAULT ''", "last_reset": "INTEGER DEFAULT 0", "owner_id": "INTEGER DEFAULT 0", "ext_id": "TEXT DEFAULT ''"})
+_db.execute("""CREATE TABLE IF NOT EXISTS api_keys(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, key_hash TEXT UNIQUE, prefix TEXT, admin_id INTEGER DEFAULT 0,
+  enabled INTEGER DEFAULT 1, created INTEGER, last_used INTEGER DEFAULT 0)""")
+ensure_cols("api_keys", {"limit_bytes": "INTEGER DEFAULT 0", "used_bytes": "INTEGER DEFAULT 0", "expiry": "INTEGER DEFAULT 0"})
+ensure_cols("clients", {"key_id": "INTEGER DEFAULT 0"})       # کلید API که این کلاینت را ساخته (0 = از پنل)
+try:
+    _db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_clients_ext ON clients(owner_id, ext_id) WHERE ext_id!=''")
+except Exception:
+    pass
 try:
     os.chmod(DB_PATH, 0o600)
 except OSError:
@@ -744,6 +753,7 @@ def admin_state(a):
 
 
 ADM_STATE = {}
+KEY_STATE = {}
 
 
 def admin_inbounds(aid):
@@ -762,6 +772,11 @@ def client_state(c):
         a = q("SELECT * FROM admins WHERE id=?", (oid,), True)
         if a and admin_state(a) != "active":
             return "admin"      # حجم/اعتبار ادمین صاحب کلاینت تمام شده یا ادمین غیرفعال است
+    kid = c["key_id"] if "key_id" in c.keys() else 0
+    if kid:
+        k = q("SELECT * FROM api_keys WHERE id=?", (kid,), True)
+        if k and key_quota_state(k) != "active":
+            return "key"        # حجم/زمان کلید API ساخنده‌ی کلاینت تمام شده
     return "active"
 
 
@@ -2248,6 +2263,8 @@ def collect_stats():
                 x("UPDATE clients SET up_bytes=up_bytes+?, down_bytes=down_bytes+? WHERE id=?", (drx, dtx, r["cid"]))
                 x("UPDATE admins SET used_bytes=used_bytes+? WHERE id=(SELECT owner_id FROM clients WHERE id=?)",
                   (drx + dtx, r["cid"]))
+                x("UPDATE api_keys SET used_bytes=used_bytes+? WHERE id=(SELECT key_id FROM clients WHERE id=?)",
+                  (drx + dtx, r["cid"]))
             if hs:
                 x("UPDATE clients SET last_seen=MAX(last_seen,?) WHERE id=?", (hs, r["cid"]))
     for c in q("SELECT * FROM clients WHERE reset_period!=''"):
@@ -2267,6 +2284,11 @@ def collect_stats():
         if ADM_STATE.get(a["id"], st) != st:
             changed |= admin_inbounds(a["id"])
         ADM_STATE[a["id"]] = st
+    for k in q("SELECT * FROM api_keys"):     # کلیدی که حجم/زمانش تمام شد یا تمدید شد → کلاینت‌های ساخته‌شده با آن قطع/وصل شود
+        st = key_quota_state(k)
+        if KEY_STATE.get(k["id"], st) != st:
+            changed |= key_inbounds(k["id"])
+        KEY_STATE[k["id"]] = st
     if changed:
         w = apply_many(changed)
         if w:
@@ -2330,10 +2352,50 @@ def _who():
     return ("admin", a["id"])
 
 
-def _guard(super_only):
+KEYFAILS = {}
+
+
+def _key_who(key):
+    """کلید API → (role, admin_id)؛ نامعتبر = None؛ تلاش‌های بیش‌ازحد = 'rate'"""
+    ip = request.remote_addr or "?"
+    n, t = KEYFAILS.get(ip, (0, now()))
+    if now() - t > 300:
+        n, t = 0, now()
+    if n >= 30:
+        return "rate"
+    r = q("SELECT * FROM api_keys WHERE key_hash=? AND enabled=1", (hashlib.sha256(key.encode()).hexdigest(),), True)
+    who = None
+    if r:
+        if r["admin_id"]:
+            a = q("SELECT * FROM admins WHERE id=?", (r["admin_id"],), True)
+            if a and a["enabled"]:
+                who = ("admin", a["id"], r["id"])
+        else:
+            who = ("super", 0, r["id"])
+    if not who:
+        KEYFAILS[ip] = (n + 1, t)
+        return None
+    if now() - (r["last_used"] or 0) > 60:
+        x("UPDATE api_keys SET last_used=? WHERE id=?", (now(), r["id"]))
+    return who
+
+
+def _guard(super_only, allow_key=True):
     def deco(fn):
         @wraps(fn)
         def w(*a, **k):
+            h = request.headers.get("Authorization", "")
+            key = h[7:].strip() if h[:7].lower() == "bearer " else request.headers.get("X-API-Key", "").strip()
+            if key:                      # درخواست با کلید API (بدون کوکی؛ CSRF موضوعیت ندارد) — فقط مسیرهای auth_any
+                kw = _key_who(key)
+                if kw == "rate":
+                    return jsonify(error="تلاش‌های زیاد؛ چند دقیقه بعد دوباره امتحان کنید"), 429
+                if not kw:
+                    return jsonify(error="کلید API نامعتبر یا غیرفعال است"), 401
+                if super_only or not allow_key:
+                    return jsonify(error="این مسیر با کلید API در دسترس نیست"), 403
+                g.role, g.aid, g.key_id, g.via_key = kw[0], kw[1], kw[2], True
+                return fn(*a, **k)
             who = _who()
             if not who:
                 return jsonify(error="auth"), 401
@@ -2349,6 +2411,7 @@ def _guard(super_only):
 
 auth = _guard(True)        # فقط مدیر اصلی (پیش‌فرض همه‌ی مسیرها)
 auth_any = _guard(False)   # مدیر اصلی یا ادمین (فقط مسیرهای کلاینت)
+auth_adm = _guard(False, False)   # مدیر اصلی یا ادمین، فقط با نشست پنل (نه با کلید API)
 
 
 @app.errorhandler(Err)
@@ -2360,6 +2423,8 @@ def on_err(e):
 def on_exc(e):
     from werkzeug.exceptions import HTTPException
     if isinstance(e, HTTPException):
+        if request.path.startswith("/api/v1/"):
+            return jsonify(error={404: "پیدا نشد (یا مال حساب شما نیست)", 405: "متد نامعتبر"}.get(e.code, e.name)), e.code
         return e
     log.exception("unhandled")
     return jsonify(error=f"خطای داخلی: {e}"), 500
@@ -2384,7 +2449,7 @@ def ser_client(c):
     links = q("""SELECT ci.*, ib.name AS ib_name, ib.proto AS ib_proto FROM client_inbound ci JOIN inbounds ib ON ib.id=ci.inbound_id
                  WHERE ci.client_id=? ORDER BY ib.id""", (c["id"],))
     d = {k: c[k] for k in ("id", "name", "token", "enabled", "reason", "public_key", "limit_bytes", "up_bytes",
-                           "down_bytes", "expiry", "note", "created", "last_seen", "reset_period", "owner_id")}
+                           "down_bytes", "expiry", "note", "created", "last_seen", "reset_period", "owner_id", "ext_id")}
     d["state"] = client_state(c)
     d["sub_url"] = f"{base_url()}/sub/{c['token']}"
     d["online"] = any(l["last_hs"] and now() - l["last_hs"] < 180 for l in links)
@@ -4037,6 +4102,8 @@ def state_admin():
 @app.get("/api/state")
 @auth_any
 def state():
+    if getattr(g, "via_key", False):
+        return jsonify(error="با کلید API از /api/v1 استفاده کنید"), 403
     return state_super() if g.role == "super" else state_admin()
 
 
@@ -4136,6 +4203,7 @@ def admin_delete(aid):
         x("DELETE FROM clients WHERE owner_id=?", (aid,))
     else:
         x("UPDATE clients SET owner_id=0 WHERE owner_id=?", (aid,))
+    x("DELETE FROM api_keys WHERE admin_id=?", (aid,))
     x("DELETE FROM admins WHERE id=?", (aid,))
     ADM_STATE.pop(aid, None)
     return jsonify(ok=True, warn=apply_many(ids))
@@ -4238,30 +4306,58 @@ def inbound_conf(iid):
     return jsonify(conf=l2tp_summary(ib) if is_l2tp(ib) else ovpn_server_conf(ib, mask=True) if is_ovpn(ib) else xray_summary(ib) if is_vless(ib) else server_conf(ib, mask=True))
 
 
-@app.post("/api/clients")
-@auth_any
-def client_create():
-    d = body()
+def create_clients(d):
+    """ساخت یک یا چند کلاینت (مشترک بین پنل و API). برمی‌گرداند: (لیست id، پیام هشدار، آیا از قبل ساخته شده بود)"""
     b = parse_client_basic(d)
     count = num(d.get("count"), 1, 1, 200, "تعداد")
-    links, owner = d.get("links"), 0
+    ext = str(d.get("external_id") or "").strip()[:100]
+    if ext and count != 1:
+        raise Err("external_id فقط با count=1 کاربرد دارد")
+    owner = g.aid if g.role == "admin" else 0
+    kid = getattr(g, "key_id", 0)
+    if kid:
+        kr = q("SELECT * FROM api_keys WHERE id=?", (kid,), True)
+        if kr and key_quota_state(kr) != "active":
+            raise Err("حجم یا زمان این کلید API تمام شده؛ از پنل تمدیدش کنید")
+    if ext:                                   # ایدمپوتنت: همان سفارش دوباره بیاید، کلاینت تکراری ساخته نمی‌شود
+        old = q("SELECT id FROM clients WHERE ext_id=? AND owner_id=?", (ext, owner), True)
+        if old:
+            return [old["id"]], "", True
+    links = d.get("links")
     if g.role == "admin":
         require_active_admin()
-        links, owner = admin_links(0, links), g.aid
-    touched = set()
+        links = admin_links(0, links)
+    cids, touched = [], set()
     for i in range(count):
         priv = gen_private()
         name = b["name"] if count == 1 else f"{b['name']}-{i + 1}"
-        cid = x("""INSERT INTO clients(name,token,enabled,private_key,public_key,limit_bytes,expiry,note,created,reset_period,last_reset,owner_id)
-                   VALUES(?,?,1,?,?,?,?,?,?,?,?,?)""",
-                (name, secrets.token_urlsafe(16), priv, pub_from_private(priv), b["limit_bytes"], b["expiry"], b["note"],
-                 now(), b["reset_period"], now(), owner))
+        try:
+            cid = x("""INSERT INTO clients(name,token,enabled,private_key,public_key,limit_bytes,expiry,note,created,reset_period,last_reset,owner_id,ext_id,key_id)
+                       VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (name, secrets.token_urlsafe(16), priv, pub_from_private(priv), b["limit_bytes"], b["expiry"], b["note"],
+                     now(), b["reset_period"], now(), owner, ext, kid))
+        except sqlite3.IntegrityError:        # دو درخواست هم‌زمان با یک external_id
+            old = q("SELECT id FROM clients WHERE ext_id=? AND owner_id=?", (ext, owner), True) if ext else None
+            if old:
+                return [old["id"]], "", True
+            raise
         try:
             touched |= save_links(cid, links)
         except Err:
             x("DELETE FROM clients WHERE id=?", (cid,))
             raise
-    return jsonify(ok=True, warn=apply_many(touched))
+        cids.append(cid)
+    return cids, apply_many(touched), False
+
+
+@app.post("/api/clients")
+@auth_any
+def client_create():
+    cids, warn, _ = create_clients(body())
+    out = dict(ok=True, warn=warn)
+    if getattr(g, "via_key", False):
+        out["clients"] = [ser_client(q("SELECT * FROM clients WHERE id=?", (c,), True)) for c in cids]
+    return jsonify(out)
 
 
 @app.put("/api/clients/<int:cid>")
@@ -4288,6 +4384,7 @@ def client_inbounds(cid):
     return {r["inbound_id"] for r in q("SELECT inbound_id FROM client_inbound WHERE client_id=?", (cid,))}
 
 
+@app.delete("/api/v1/clients/<int:cid>")
 @app.delete("/api/clients/<int:cid>")
 @auth_any
 def client_delete(cid):
@@ -4311,6 +4408,7 @@ def client_toggle(cid):
     return jsonify(ok=True, warn=apply_many(client_inbounds(cid)))
 
 
+@app.post("/api/v1/clients/<int:cid>/reset-traffic")
 @app.post("/api/clients/<int:cid>/reset-traffic")
 @auth_any
 def client_reset(cid):
@@ -4321,6 +4419,7 @@ def client_reset(cid):
     return jsonify(ok=True, warn=apply_many(client_inbounds(cid)))
 
 
+@app.post("/api/v1/clients/<int:cid>/reset-token")
 @app.post("/api/clients/<int:cid>/reset-token")
 @auth_any
 def client_reset_token(cid):
@@ -4351,6 +4450,507 @@ def client_regen(cid):
         for i_ in ov_ids:
             sync_inbound_clients(i_)
     return jsonify(ok=True, warn=apply_many(client_inbounds(cid)))
+
+
+# ------------------------------ API عمومی (/api/v1) و کلیدهای API ------------------------------
+# ربات تلگرام یا سایت با «کلید API» (هدر Authorization: Bearer ...) فقط کار با کلاینت‌ها را می‌تواند انجام دهد:
+# ساخت، تمدید، فعال/غیرفعال، ریست ترافیک، حذف و خواندن لینک اشتراک. کلید هیچ‌وقت به تنظیمات، نودها، تانل و ادمین‌ها دسترسی ندارد.
+def _v1_client(cid):
+    return ser_client(q("SELECT * FROM clients WHERE id=?", (cid,), True))
+
+
+@app.get("/api/v1/me")
+@auth_any
+def v1_me():
+    out = dict(role=g.role)
+    kr = q("SELECT * FROM api_keys WHERE id=?", (getattr(g, "key_id", 0),), True)
+    if kr:
+        out["key"] = ser_key(kr)
+    if g.role == "admin":
+        out["account"] = ser_admin(q("SELECT * FROM admins WHERE id=?", (g.aid,), True))
+    return jsonify(out)
+
+
+@app.get("/api/v1/inbounds")
+@auth_any
+def v1_inbounds():
+    ups = up_ifaces()
+    return jsonify(inbounds=[dict(id=r["id"], name=r["name"], remark=r["remark"], proto=r["proto"] or "wg", port=r["port"],
+                                  node_id=ib_node(r), up=(r["name"] in ups) if not ib_node(r) else node_up(r))
+                             for r in q("SELECT * FROM inbounds WHERE enabled=1 ORDER BY id")])
+
+
+@app.get("/api/v1/clients")
+@auth_any
+def v1_clients():
+    cond, args = [], []
+    if g.role == "admin":
+        cond.append("owner_id=?"); args.append(g.aid)
+    for key, col in (("name", "name"), ("token", "token"), ("external_id", "ext_id")):
+        v = request.args.get(key)
+        if v:
+            cond.append(f"{col}=?"); args.append(v)
+    s = request.args.get("q")
+    if s:
+        cond.append("(name LIKE ? OR note LIKE ?)"); args += [f"%{s}%", f"%{s}%"]
+    w = (" WHERE " + " AND ".join(cond)) if cond else ""
+    limit = num(request.args.get("limit"), 50, 1, 200, "limit")
+    offset = num(request.args.get("offset"), 0, 0, None, "offset")
+    total = q("SELECT COUNT(*) n FROM clients" + w, tuple(args), True)["n"]
+    rows = q("SELECT * FROM clients" + w + " ORDER BY id DESC LIMIT ? OFFSET ?", tuple(args) + (limit, offset))
+    return jsonify(total=total, clients=[ser_client(c) for c in rows])
+
+
+@app.get("/api/v1/clients/<int:cid>")
+@auth_any
+def v1_client_get(cid):
+    return jsonify(client=ser_client(owned(cid)))
+
+
+@app.post("/api/v1/clients")
+@auth_any
+def v1_client_create():
+    d = dict(body())
+    ibs = d.get("inbounds")
+    if ibs is not None and not d.get("links"):
+        if not isinstance(ibs, list) or not ibs:
+            raise Err("inbounds باید لیست id اینباندها باشد؛ مثلاً [1, 2]")
+        d["links"] = [dict(inbound_id=num(i, 0, 1, None, "id اینباند")) for i in ibs]
+    if d.get("days") not in (None, "") and not d.get("expiry"):
+        days = num(d.get("days"), 0, 0, 36500, "تعداد روز")
+        d["expiry"] = now() + days * 86400 if days else 0
+    cids, warn, existed = create_clients(d)
+    return jsonify(ok=True, existing=existed, warn=warn, clients=[_v1_client(c) for c in cids]), (200 if existed else 201)
+
+
+@app.post("/api/v1/clients/<int:cid>/renew")
+@auth_any
+def v1_client_renew(cid):
+    """تمدید/تغییر: add_gb و add_days نسبی‌اند (منفی = کم کردن)؛ limit_gb و days مقدار مطلق؛ reset_traffic مصرف را صفر می‌کند"""
+    c = owned(cid)
+    d = body()
+    if g.role == "admin":
+        require_active_admin()
+    lim, exp = c["limit_bytes"], c["expiry"]
+    did = False
+    if d.get("limit_gb") not in (None, ""):
+        lim, did = _gb_bytes(d.get("limit_gb")), True
+    if d.get("days") not in (None, ""):
+        n = num(d.get("days"), 0, 0, 36500, "تعداد روز")
+        exp, did = (now() + n * 86400 if n else 0), True
+    if d.get("add_gb") not in (None, "", 0, "0"):
+        try:
+            lim = (lim or 0) + int(float(d.get("add_gb")) * 1024 ** 3)
+        except Exception:
+            raise Err("حجم نامعتبر است")
+        if lim <= 0:
+            raise Err("با این کم کردن حجم صفر یا منفی می‌شود؛ برای نامحدود limit_gb را 0 بدهید")
+        did = True
+    if d.get("add_days") not in (None, "", 0, "0"):
+        n = num(d.get("add_days"), 0, -36500, 36500, "تعداد روز")
+        exp, did = (max(exp, now()) if exp else now()) + n * 86400, True
+    reset = bool(d.get("reset_traffic"))
+    if not (did or reset):
+        raise Err("حداقل یکی از add_gb ، add_days ، limit_gb ، days ، reset_traffic را بدهید")
+    up, down = (0, 0) if reset else (c["up_bytes"], c["down_bytes"])
+    x("UPDATE clients SET limit_bytes=?, expiry=?, up_bytes=?, down_bytes=? WHERE id=?", (lim, exp, up, down, cid))
+    c2 = q("SELECT * FROM clients WHERE id=?", (cid,), True)
+    if not c2["enabled"] and c2["reason"] in ("expired", "limit") and usage_state(c2) == "active":
+        x("UPDATE clients SET enabled=1, reason='' WHERE id=?", (cid,))
+    return jsonify(ok=True, warn=apply_many(client_inbounds(cid)), client=_v1_client(cid))
+
+
+@app.post("/api/v1/clients/<int:cid>/enable")
+@auth_any
+def v1_client_enable(cid):
+    c = owned(cid)
+    require_active_admin()
+    if usage_state(c) != "active":
+        raise Err("حجم یا اعتبار کلاینت تمام شده؛ اول renew بزنید")
+    x("UPDATE clients SET enabled=1, reason='' WHERE id=?", (cid,))
+    return jsonify(ok=True, warn=apply_many(client_inbounds(cid)), client=_v1_client(cid))
+
+
+@app.post("/api/v1/clients/<int:cid>/disable")
+@auth_any
+def v1_client_disable(cid):
+    owned(cid)
+    x("UPDATE clients SET enabled=0, reason='disabled' WHERE id=?", (cid,))
+    return jsonify(ok=True, warn=apply_many(client_inbounds(cid)), client=_v1_client(cid))
+
+
+def key_quota_state(k):
+    """وضعیت سهمیه‌ی کلید (غیرفعال بودن کلید حساب نمی‌شود؛ فقط حجم و زمان)"""
+    if k["expiry"] and now() >= k["expiry"]:
+        return "expired"
+    if k["limit_bytes"] and k["used_bytes"] >= k["limit_bytes"]:
+        return "limit"
+    return "active"
+
+
+def key_inbounds(kid):
+    return {r["inbound_id"] for r in q(
+        "SELECT ci.inbound_id FROM client_inbound ci JOIN clients c ON c.id=ci.client_id WHERE c.key_id=?", (kid,))}
+
+
+def ser_key(r):
+    a = q("SELECT username FROM admins WHERE id=?", (r["admin_id"],), True) if r["admin_id"] else None
+    acc = ("ادمین: " + a["username"]) if a else ("ادمینِ حذف‌شده" if r["admin_id"] else "مدیر اصلی")
+    st = "disabled" if not r["enabled"] else key_quota_state(r)
+    return dict(id=r["id"], name=r["name"], prefix=r["prefix"], admin_id=r["admin_id"], account=acc,
+                enabled=bool(r["enabled"]), created=r["created"], last_used=r["last_used"],
+                limit_bytes=r["limit_bytes"], used_bytes=r["used_bytes"], expiry=r["expiry"], state=st,
+                clients=q("SELECT COUNT(*) n FROM clients WHERE key_id=?", (r["id"],), True)["n"])
+
+
+def _own_key(kid):
+    r = q("SELECT * FROM api_keys WHERE id=?", (kid,), True) or abort(404)
+    if g.role == "admin" and r["admin_id"] != g.aid:
+        abort(404)
+    return r
+
+
+def _gb_bytes(v, label="حجم"):
+    try:
+        gb = float(v or 0)
+    except Exception:
+        raise Err(f"{label} نامعتبر است")
+    if gb < 0:
+        raise Err(f"{label} نمی‌تواند منفی باشد")
+    return int(gb * 1024 ** 3)
+
+
+@app.get("/api/apikeys")
+@auth_adm
+def apikey_list():
+    if g.role == "admin":
+        rows = q("SELECT * FROM api_keys WHERE admin_id=? ORDER BY id DESC", (g.aid,))
+    else:
+        rows = q("SELECT * FROM api_keys ORDER BY id DESC")
+    return jsonify(keys=[ser_key(r) for r in rows])
+
+
+@app.post("/api/apikeys")
+@auth_adm
+def apikey_create():
+    d = body()
+    name = oneline(d.get("name"))[:40]
+    if not name:
+        raise Err("یک نام برای کلید بنویسید")
+    if g.role == "admin":
+        require_active_admin()
+        aid = g.aid                             # ادمین فقط برای خودش کلید می‌سازد
+    else:
+        aid = num(d.get("admin_id"), 0, 0, None, "ادمین")
+        if aid and not q("SELECT 1 FROM admins WHERE id=?", (aid,), True):
+            raise Err("ادمین انتخاب‌شده پیدا نشد")
+    lim = _gb_bytes(d.get("limit_gb"), "حجم کلید")
+    days = num(d.get("days"), 0, 0, 36500, "تعداد روز")
+    key = "sp_" + secrets.token_urlsafe(32)
+    x("INSERT INTO api_keys(name,key_hash,prefix,admin_id,enabled,created,last_used,limit_bytes,used_bytes,expiry) VALUES(?,?,?,?,1,?,0,?,0,?)",
+      (name, hashlib.sha256(key.encode()).hexdigest(), key[:9], aid, now(), lim, now() + days * 86400 if days else 0))
+    return jsonify(ok=True, key=key)          # فقط همین یک‌بار نمایش داده می‌شود؛ در دیتابیس فقط هش ذخیره است
+
+
+@app.put("/api/apikeys/<int:kid>")
+@auth_adm
+def apikey_update(kid):
+    """ویرایش نام و سهمیه‌ی کلید؛ limit_gb / days مقدار مطلق، add_gb / add_days تغییر نسبی (منفی = کم کردن)"""
+    r = _own_key(kid)
+    d = body()
+    name = oneline(d.get("name") or r["name"])[:40]
+    lim, exp, used = r["limit_bytes"], r["expiry"], r["used_bytes"]
+    if d.get("limit_gb") not in (None, ""):
+        lim = _gb_bytes(d.get("limit_gb"), "حجم کلید")
+    if d.get("add_gb") not in (None, "", 0, "0"):
+        try:
+            lim = (lim or 0) + int(float(d.get("add_gb")) * 1024 ** 3)
+        except Exception:
+            raise Err("مقدار تغییر حجم نامعتبر است")
+        if lim <= 0:
+            raise Err("با این کم کردن حجم صفر یا منفی می‌شود؛ برای نامحدود limit_gb را 0 بدهید")
+    if d.get("days") not in (None, ""):
+        n = num(d.get("days"), 0, 0, 36500, "تعداد روز")
+        exp = now() + n * 86400 if n else 0
+    if d.get("add_days") not in (None, "", 0, "0"):
+        n = num(d.get("add_days"), 0, -36500, 36500, "تغییر روز")
+        exp = (max(exp, now()) if exp else now()) + n * 86400
+    if d.get("reset_usage"):
+        used = 0
+    x("UPDATE api_keys SET name=?, limit_bytes=?, expiry=?, used_bytes=? WHERE id=?", (name, lim, exp, used, kid))
+    KEY_STATE[kid] = key_quota_state(q("SELECT * FROM api_keys WHERE id=?", (kid,), True))
+    return jsonify(ok=True, warn=apply_many(key_inbounds(kid)))      # کلاینت‌های این کلید با سهمیه‌ی جدید قطع/وصل می‌شوند
+
+
+@app.post("/api/apikeys/<int:kid>/toggle")
+@auth_adm
+def apikey_toggle(kid):
+    r = _own_key(kid)
+    x("UPDATE api_keys SET enabled=? WHERE id=?", (0 if r["enabled"] else 1, kid))
+    return jsonify(ok=True)
+
+
+@app.delete("/api/apikeys/<int:kid>")
+@auth_adm
+def apikey_delete(kid):
+    _own_key(kid)
+    x("DELETE FROM api_keys WHERE id=?", (kid,))
+    x("UPDATE clients SET key_id=0 WHERE key_id=?", (kid,))      # کلاینت‌ها می‌مانند، فقط دیگر به سهمیه‌ی این کلید وصل نیستند
+    KEY_STATE.pop(kid, None)
+    return jsonify(ok=True)
+
+
+@app.get("/api/docs")
+@auth_adm
+def api_docs():
+    return jsonify(html=api_docs_html(base_url()))
+
+
+def api_docs_html(base):
+    def code(s):
+        return ('<div class="cb"><button class="s cp" onclick="copy(this.nextElementSibling.innerText)">کپی</button><pre><code>'
+                + html.escape(s.strip("\n").replace("@@B@@", base)) + "</code></pre></div>")
+
+    def ep(m, path, desc, params=(), ex=None, resp=None):
+        cls = {"GET": "get", "POST": "post", "DELETE": "del"}[m]
+        o = f'<div class="ep"><div><span class="m {cls}">{m}</span><code>{html.escape(path)}</code></div><p>{desc}</p>'
+        if params:
+            o += "<table><tr><th>پارامتر</th><th>توضیح</th></tr>" + "".join(
+                f"<tr><td><code>{html.escape(a)}</code></td><td>{b}</td></tr>" for a, b in params) + "</table>"
+        if ex:
+            o += code(ex)
+        if resp:
+            o += '<p class="mut sm">نمونه پاسخ:</p>' + code(resp)
+        return o + "</div>"
+
+    H = []
+    H.append("<h3>این بخش چه کاری می‌کند؟</h3><p>با API می‌توانید پنل را به ربات تلگرام، سایت یا هر نرم‌افزار دیگری وصل کنید تا فروش خودکار شود: مشتری پرداخت می‌کند ← ربات/سایت شما یک درخواست به پنل می‌فرستد ← پنل کلاینت را می‌سازد و <code>sub_url</code> (لینک اشتراک) را برمی‌گرداند ← شما همان لینک را به مشتری تحویل می‌دهید. تمدید، ریست ترافیک، غیرفعال‌سازی و حذف هم با همین API انجام می‌شود.</p>")
+    H.append("<h3>شروع سریع</h3><ol>"
+             "<li>(پیشنهادی) از تب «ادمین‌ها» یک ادمین مثلاً <code>bot</code> بسازید و برایش سقف حجم و زمان بگذارید. هرچه ربات بفروشد از همین سقف مصرف می‌شود؛ اگر کلید لو برود، خسارت از این سقف بیشتر نمی‌شود.</li>"
+             "<li>بالای همین صفحه «+ کلید جدید» بزنید، همان ادمین را انتخاب کنید و کلید را کپی کنید. کلید فقط یک‌بار نمایش داده می‌شود و در پنل فقط هش آن ذخیره است.</li>"
+             "<li>با دستور زیر امتحان کنید. اگر <code>role</code> برگشت، اتصال برقرار است:</li></ol>")
+    H.append(code('curl -H "Authorization: Bearer sp_XXXXXXXX" @@B@@/api/v1/me'))
+    H.append("<h3>احراز هویت و امنیت</h3><ul>"
+             "<li>در هر درخواست یکی از این دو هدر را بفرستید: <code>Authorization: Bearer &lt;key&gt;</code> یا <code>X-API-Key: &lt;key&gt;</code>. هدر دیگری لازم نیست.</li>"
+             "<li>کلید فقط به مسیرهای <code>/api/v1/…</code> (کلاینت‌ها و لیست اینباندها) دسترسی دارد؛ تنظیمات، نودها، تانل، ادمین‌ها و کلیدها با کلید در دسترس نیستند.</li>"
+             "<li>کلید را فقط روی سرور ربات/سایت نگه دارید؛ هرگز در کد سمت کاربر (مرورگر، اپ) یا پیام تلگرام نگذارید.</li>"
+             "<li>حتماً آدرس پنل HTTPS باشد (دامنه و گواهی را در تب «تنظیمات» بگذارید)، وگرنه کلید روی شبکه لو می‌رود.</li>"
+             "<li>هر کلید می‌تواند سقف حجم و زمان مخصوص خودش را داشته باشد؛ فقط مصرف کلاینت‌هایی که با همان کلید ساخته شده‌اند از آن کم می‌شود. تمام شدن سقف کلید، ساخت جدید را رد می‌کند و کلاینت‌های همان کلید را قطع می‌کند (<code>state: key</code>)؛ با تمدید سقف از پنل خودکار وصل می‌شوند. ادمین‌ها از همین تب کلیدهای خودشان را می‌سازند و سقفشان را کم و زیاد می‌کنند.</li>"
+             "<li>برای قطع دسترسی، کلید را «غیرفعال» یا «حذف» کنید؛ بلافاصله اثر می‌کند. تلاش با کلید اشتباه محدود می‌شود (بعد از چند بار، کد 429).</li></ul>")
+    H.append("<h3>فرمت درخواست و پاسخ</h3><p>بدنه‌ی درخواست‌ها JSON است (<code>Content-Type: application/json</code>) و همه‌ی پاسخ‌ها JSON. زمان‌ها Unix timestamp به ثانیه‌اند (<code>expiry</code> برابر 0 یعنی بدون انقضا) و حجم‌ها به بایت (<code>limit_bytes</code> برابر 0 یعنی نامحدود). خطا همیشه به شکل <code>{\"error\": \"پیام\"}</code> با یکی از کدهای 400 (ورودی نامعتبر)، 401 (کلید نامعتبر)، 403، 404 (کلاینت پیدا نشد یا مال شما نیست) یا 429 برمی‌گردد. فیلد <code>warn</code> در پاسخ‌ها اگر پر باشد یعنی کلاینت ساخته/تغییر کرده ولی اعمالش روی یک اینباند خطا داشته.</p>")
+    H.append("<h3>مرجع مسیرها</h3>")
+    H.append(ep("GET", "/api/v1/me", "نقش کلید، سقف حجم/زمان و مصرف خودِ کلید (<code>key</code>) و برای کلید ادمین مصرف حساب ادمین (<code>account</code>) را نشان می‌دهد؛ برای چک کردن موجودی سهمیه‌ی ربات خوب است.",
+                ex='curl -H "Authorization: Bearer $KEY" @@B@@/api/v1/me',
+                resp='{"role": "admin", "key": {"name": "bot", "limit_bytes": 107374182400, "used_bytes": 52428800, "expiry": 1798000000, "state": "active", "clients": 12},\n "account": {"username": "bot", "limit_bytes": 1073741824000, "used_bytes": 52428800, "expiry": 0, "state": "active"}}'))
+    H.append(ep("GET", "/api/v1/inbounds", "اینباندهای فعال را می‌دهد تا id هر اینباند را برای ساخت کلاینت بدانید (id را یک‌بار بردارید و در ربات ثابت بگذارید).",
+                ex='curl -H "Authorization: Bearer $KEY" @@B@@/api/v1/inbounds',
+                resp='{"inbounds": [{"id": 1, "name": "wg0", "remark": "", "proto": "wg", "port": 51820, "node_id": 0, "up": true},\n  {"id": 2, "name": "vless-de", "remark": "آلمان", "proto": "vless", "port": 443, "node_id": 1, "up": true}]}'))
+    H.append(ep("POST", "/api/v1/clients", "یک کلاینت (یا چند تا) می‌سازد و همان لحظه کانفیگ را روی اینباندهای انتخاب‌شده اعمال می‌کند. اصلی‌ترین مسیر برای فروش.",
+                params=[("name", "نام کلاینت (الزامی)؛ مثلاً <code>tg12345-1001</code>"),
+                        ("inbounds", "لیست id اینباندها (الزامی)؛ مثلاً <code>[1, 2]</code>"),
+                        ("limit_gb", "حجم به گیگابایت؛ 0 یا نفرستادن = نامحدود"),
+                        ("days", "اعتبار به روز، از همین الان؛ 0 یا نفرستادن = بدون انقضا. (یا به‌جایش <code>expiry</code> = Unix timestamp)"),
+                        ("external_id", "شناسه‌ی سفارش شما (پیشنهاد قوی). اگر همین سفارش دوباره بیاید (مثلاً درگاه دوبار callback بزند) کلاینت تکراری ساخته نمی‌شود و همان قبلی با <code>existing: true</code> برمی‌گردد."),
+                        ("note", "یادداشت دلخواه (مثلاً آیدی تلگرام خریدار)"),
+                        ("reset_period", "<code>daily</code> / <code>weekly</code> / <code>monthly</code> برای ریست خودکار ترافیک؛ خالی = بدون ریست"),
+                        ("count", "تعداد کلاینت (پیش‌فرض 1، حداکثر 200)؛ با <code>external_id</code> فقط 1")],
+                ex='curl -X POST @@B@@/api/v1/clients \\\n  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\\n  -d \'{"name": "tg12345-1001", "limit_gb": 30, "days": 30, "inbounds": [1, 2], "external_id": "1001", "note": "tg:12345"}\'',
+                resp='{"ok": true, "existing": false, "warn": "",\n "clients": [{"id": 12, "name": "tg12345-1001", "state": "active", "enabled": 1,\n   "limit_bytes": 32212254720, "up_bytes": 0, "down_bytes": 0, "expiry": 1795000000,\n   "token": "Ab3xYz...", "sub_url": "@@B@@/sub/Ab3xYz...", "ext_id": "1001",\n   "links": [{"inbound_id": 2, "ib_name": "vless-de", "proto": "vless", "vlink": "vless://..."}]}]}'))
+    H.append(ep("GET", "/api/v1/clients", "لیست کلاینت‌ها (کلید ادمین فقط کلاینت‌های خودش را می‌بیند). برای نمایش وضعیت و مصرف به مشتری یا پیدا کردن کلاینت از روی سفارش.",
+                params=[("external_id", "پیدا کردن کلاینت یک سفارش"), ("name", "نام دقیق"), ("token", "توکن داخل لینک اشتراک (مشتری لینکش را بفرستد، شما کلاینتش را پیدا کنید)"),
+                        ("q", "جستجو در نام و یادداشت (مثلاً آیدی تلگرام)"), ("limit / offset", "صفحه‌بندی؛ پیش‌فرض 50، حداکثر 200")],
+                ex='curl -H "Authorization: Bearer $KEY" "@@B@@/api/v1/clients?q=tg:12345"',
+                resp='{"total": 1, "clients": [ {…مثل بالا…} ]}'))
+    H.append(ep("GET", "/api/v1/clients/{id}", "اطلاعات و مصرف یک کلاینت. مصرف = <code>up_bytes + down_bytes</code>. <code>state</code> یکی از: <code>active</code>، <code>expired</code> (زمان تمام)، <code>limit</code> (حجم تمام)، <code>disabled</code>، <code>admin</code> (سقف ادمین صاحبش تمام شده).",
+                ex='curl -H "Authorization: Bearer $KEY" @@B@@/api/v1/clients/12'))
+    H.append(ep("POST", "/api/v1/clients/{id}/renew", "تمدید و تغییر حجم/زمان (کم و زیاد). هر ترکیبی از گزینه‌های زیر را می‌توانید بدهید؛ اگر کلاینت به‌خاطر اتمام حجم/زمان قطع شده بود و بعد از تغییر دوباره معتبر شود، خودکار وصل می‌شود.",
+                params=[("add_days", "به روز اضافه می‌کند؛ منفی = کم می‌کند. اگر اعتبار هنوز مانده، از انتهای همان حساب می‌شود وگرنه از الان"),
+                        ("add_gb", "به سقف حجم اضافه می‌کند؛ منفی = کم می‌کند (کلاینت نامحدود با این گزینه محدود می‌شود)"),
+                        ("limit_gb / days", "مقدار مطلق: سقف حجم را دقیقاً این عدد می‌گذارد (0 = نامحدود) و اعتبار را از همین الان این‌قدر روز می‌کند (0 = بدون انقضا)"),
+                        ("reset_traffic", "<code>true</code> = مصرف را صفر می‌کند. تمدید ماهانه‌ی معمول: <code>{\"add_days\": 30, \"reset_traffic\": true}</code>")],
+                ex='curl -X POST @@B@@/api/v1/clients/12/renew \\\n  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\\n  -d \'{"add_days": 30, "reset_traffic": true}\'',
+                resp='{"ok": true, "warn": "", "client": {…کلاینت به‌روز…}}'))
+    H.append(ep("POST", "/api/v1/clients/{id}/disable", "کلاینت را قطع می‌کند (قابل برگشت)."))
+    H.append(ep("POST", "/api/v1/clients/{id}/enable", "کلاینت را دوباره وصل می‌کند؛ اگر حجم یا زمانش تمام شده باشد خطا می‌دهد و اول باید renew بزنید."))
+    H.append(ep("POST", "/api/v1/clients/{id}/reset-traffic", "فقط مصرف را صفر می‌کند."))
+    H.append(ep("POST", "/api/v1/clients/{id}/reset-token", "لینک اشتراک را عوض می‌کند و لینک قبلی از کار می‌افتد (وقتی مشتری لینکش را لو داده). لینک جدید را با GET همان کلاینت بخوانید."))
+    H.append(ep("DELETE", "/api/v1/clients/{id}", "کلاینت را برای همیشه حذف می‌کند.",
+                ex='curl -X DELETE -H "Authorization: Bearer $KEY" @@B@@/api/v1/clients/12'))
+    H.append("<h3>لینک اشتراک (sub_url)</h3><p>همان <code>sub_url</code> را به مشتری بدهید. برنامه‌های کلاینت (V2Ray، Hiddify، Streisand، …) آن را به‌صورت اشتراک می‌خوانند و مرورگر یک صفحه‌ی زیبا با QR و آموزش نشان می‌دهد. پارامترهای اختیاری: <code>?format=raw</code> (لینک‌های خام)، <code>?format=json</code>، <code>?format=conf</code>، <code>?inbound=ID</code> (فقط یک اینباند). فایل تک‌تک: <code>/sub/&lt;token&gt;/&lt;inbound_id&gt;.conf</code> (یا <code>.ovpn</code>) و QR: <code>/sub/&lt;token&gt;/link.svg</code>. وقتی حجم/زمان کلاینت تمام شود لینک اشتراک 403 می‌دهد.</p>")
+    H.append("<h3>الگوی فروش خودکار (پیشنهادی)</h3><ol>"
+             "<li>مشتری در ربات/سایت پلن را انتخاب می‌کند و به درگاه پرداخت می‌رود؛ برای هر سفارش یک شناسه‌ی یکتا (<code>order_id</code>) در دیتابیس خودتان بسازید.</li>"
+             "<li>در callback درگاه، پرداخت را حتماً با verify خود درگاه تأیید کنید (به پارامترهای callback اعتماد نکنید).</li>"
+             "<li>بعد از تأیید، <code>POST /api/v1/clients</code> را با <code>external_id = order_id</code> صدا بزنید و <code>sub_url</code> را به مشتری بدهید. چون <code>external_id</code> دارید، تکرار callback خطری ندارد.</li>"
+             "<li>تمدید: همان کلاینت را با <code>renew</code> تمدید کنید (id کلاینت را کنار سفارش ذخیره کنید یا با <code>external_id</code> پیدا کنید).</li>"
+             "<li>اگر شبکه یا پنل خطا داد، همان درخواست را با همان <code>external_id</code> دوباره بفرستید؛ نتیجه یکی است.</li></ol>")
+    H.append("<h3>نمونه کد: کتابخانه‌ی کوچک پایتون</h3><p>همه‌ی نمونه‌های بعدی از همین فایل استفاده می‌کنند؛ آن را به‌صورت <code>panel.py</code> کنار ربات بگذارید (<code>pip install requests</code>).</p>")
+    H.append(code(r"""
+import requests
+
+PANEL = "@@B@@"
+KEY = "sp_XXXXXXXX"          # فقط روی سرور ربات؛ بهتر است از متغیر محیطی بخوانید
+INBOUNDS = [1, 2]            # id اینباندهایی که به مشتری داده می‌شود (از /api/v1/inbounds)
+
+_s = requests.Session()
+_s.headers["Authorization"] = "Bearer " + KEY
+
+
+def call(method, path, **kw):
+    r = _s.request(method, PANEL + "/api/v1" + path, timeout=60, **kw)
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError("پاسخ نامعتبر از پنل: %s" % r.text[:200])
+    if r.status_code >= 400:
+        raise RuntimeError(data.get("error", "خطا"))
+    return data
+
+
+def create_client(name, gb, days, order_id, note=""):
+    d = call("POST", "/clients", json={
+        "name": name, "limit_gb": gb, "days": days, "inbounds": INBOUNDS,
+        "external_id": str(order_id), "note": note})
+    return d["clients"][0]
+
+
+def renew_client(client_id, days=30, gb=0):
+    body = {"add_days": days, "reset_traffic": True}
+    if gb:
+        body["add_gb"] = gb
+    return call("POST", "/clients/%d/renew" % client_id, json=body)["client"]
+
+
+def find_by_token(token):
+    d = call("GET", "/clients", params={"token": token})
+    return d["clients"][0] if d["clients"] else None
+
+
+def usage_text(c):
+    used = (c["up_bytes"] + c["down_bytes"]) / 1024 ** 3
+    total = "نامحدود" if not c["limit_bytes"] else "%.1f گیگ" % (c["limit_bytes"] / 1024 ** 3)
+    return "وضعیت: %s\nمصرف: %.2f گیگ از %s" % (c["state"], used, total)
+"""))
+    H.append("<h3>نمونه کد: ربات تلگرام (python-telegram-bot نسخه 20 به بالا)</h3><p>ربات پلن‌ها را نشان می‌دهد و بعد از «تأیید پرداخت» سرویس را می‌سازد. تابع‌های <code>make_payment_link</code> و <code>payment_ok</code> را با درگاه خودتان پر کنید؛ بقیه آماده است.</p>")
+    H.append(code(r"""
+# pip install "python-telegram-bot>=20" requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import panel                                   # فایل بالا
+
+BOT_TOKEN = "123456:ABC..."
+PLANS = {                                      # کد: (عنوان، گیگ، روز، قیمت)
+    "p1": ("۳۰ گیگ - ۳۰ روزه", 30, 30, 150000),
+    "p2": ("۱۰۰ گیگ - ۳۰ روزه", 100, 30, 350000),
+}
+
+
+def make_payment_link(user_id, plan, order_id):
+    # اینجا سفارش را در دیتابیس خودتان ثبت کنید و لینک پرداخت درگاه را برگردانید
+    return "https://pay.example.com/pay/%s" % order_id
+
+
+def payment_ok(order_id):
+    # اینجا با API درگاه (verify) چک کنید پرداخت واقعاً انجام شده؛ True / False
+    return False
+
+
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    kb = [[InlineKeyboardButton("%s — %s تومان" % (t, format(p, ",")), callback_data="buy:" + k)]
+          for k, (t, gb, d, p) in PLANS.items()]
+    await update.message.reply_text("یک پلن انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def buy(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    plan = q.data.split(":")[1]
+    order_id = "%d-%d" % (q.from_user.id, q.message.message_id)       # شناسه‌ی یکتای سفارش
+    ctx.user_data["order"] = (order_id, plan)
+    kb = [[InlineKeyboardButton("پرداخت کردم ✅", callback_data="paid")]]
+    await q.message.reply_text("لینک پرداخت:\n" + make_payment_link(q.from_user.id, plan, order_id),
+                               reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def paid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    order = ctx.user_data.get("order")
+    if not order or not payment_ok(order[0]):
+        await q.message.reply_text("پرداخت هنوز تأیید نشده.")
+        return
+    order_id, plan = order
+    title, gb, days, _ = PLANS[plan]
+    c = panel.create_client("tg%d-%s" % (q.from_user.id, order_id), gb, days, order_id, note="tg:%d" % q.from_user.id)
+    await q.message.reply_text("✅ سرویس شما آماده است\n%s\n\nلینک اشتراک (در برنامه‌ی V2Ray/Hiddify اضافه کنید):\n%s"
+                               % (title, c["sub_url"]))
+
+
+app = Application.builder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(CallbackQueryHandler(buy, pattern="^buy:"))
+app.add_handler(CallbackQueryHandler(paid, pattern="^paid$"))
+app.run_polling()
+"""))
+    H.append("<h3>نمونه کد: وب‌هوک پرداخت برای سایت (Flask)</h3><p>برای سایت یا ربات‌هایی که درگاه خودش callback می‌زند. این نمونه بعد از تأیید پرداخت سرویس را می‌سازد و لینک را با Bot API تلگرام برای مشتری می‌فرستد (به <code>pip install flask requests</code> نیاز دارد).</p>")
+    H.append(code(r"""
+from flask import Flask, request
+import requests, panel
+
+app = Flask(__name__)
+BOT_TOKEN = "123456:ABC..."
+
+
+def gateway_verify(form):
+    # با API درگاه تأیید کنید؛ True / False
+    return False
+
+
+def get_order(order_id):
+    # از دیتابیس خودتان: dict(id=..., tg_id=..., gb=30, days=30)
+    raise NotImplementedError
+
+
+@app.post("/payment/callback")
+def callback():
+    order = get_order(request.form["order_id"])
+    if not gateway_verify(request.form):
+        return "fail", 400
+    # external_id = شناسه‌ی سفارش → اگر درگاه چند بار callback بزند فقط یک کلاینت ساخته می‌شود
+    c = panel.create_client("web-%s" % order["id"], order["gb"], order["days"], order["id"], note="web")
+    requests.post("https://api.telegram.org/bot%s/sendMessage" % BOT_TOKEN,
+                  json={"chat_id": order["tg_id"], "text": "✅ سرویس شما آماده است:\n" + c["sub_url"]}, timeout=20)
+    return "ok"
+"""))
+    H.append("<h3>نمونه‌ی کوتاه Node.js و PHP</h3>")
+    H.append(code(r"""
+// Node 18+
+const r = await fetch("@@B@@/api/v1/clients", {
+  method: "POST",
+  headers: { Authorization: "Bearer " + process.env.PANEL_KEY, "Content-Type": "application/json" },
+  body: JSON.stringify({ name: "web-1001", limit_gb: 30, days: 30, inbounds: [1, 2], external_id: "1001" }),
+});
+const data = await r.json();
+if (!r.ok) throw new Error(data.error);
+console.log(data.clients[0].sub_url);
+"""))
+    H.append(code(r"""
+<?php
+$ch = curl_init("@@B@@/api/v1/clients");
+curl_setopt_array($ch, [
+  CURLOPT_POST => true, CURLOPT_RETURNTRANSFER => true,
+  CURLOPT_HTTPHEADER => ["Authorization: Bearer " . getenv("PANEL_KEY"), "Content-Type: application/json"],
+  CURLOPT_POSTFIELDS => json_encode(["name" => "web-1001", "limit_gb" => 30, "days" => 30, "inbounds" => [1, 2], "external_id" => "1001"]),
+]);
+$data = json_decode(curl_exec($ch), true);
+echo $data["clients"][0]["sub_url"];
+"""))
+    H.append("<h3>نکات مهم</h3><ul>"
+             "<li>سرور ربات/سایت باید به آدرس پنل دسترسی داشته باشد؛ اگر پنل پشت فایروال است، آی‌پی سرور ربات را در فایروال باز کنید.</li>"
+             "<li>کلیدی که به ادمین وصل است فقط همان ادمین را می‌بیند: کلاینت‌هایی که با آن می‌سازید به نام همان ادمین ثبت می‌شوند و از سقف حجم/زمانش مصرف می‌کنند. اگر سقف ادمین تمام شود ساخت جدید خطا می‌دهد و کلاینت‌هایش هم قطع می‌شوند؛ از تب «ادمین‌ها» تمدیدش کنید.</li>"
+             "<li>اگر حذف ادمین را بزنید، کلیدهای وصل‌شده به او هم حذف می‌شوند.</li>"
+             "<li>ساخت کلاینت روی اینباند وایرگارد و OpenVPN و L2TP هم ممکن است؛ اما برای فروش، اینباندهای VLESS روی نودها معمولاً راحت‌ترین‌اند چون لینک ساب همه‌ی لوکیشن‌ها را در یک لینک جمع می‌کند.</li>"
+             "<li>مسیرهای قدیمی‌تر <code>/api/clients/…</code> هم با کلید کار می‌کنند، ولی پایدارِ مستند <code>/api/v1</code> است.</li></ul>")
+    return "".join(H)
 
 
 @app.put("/api/settings")
@@ -4937,6 +5537,12 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
  .brand{height:56px}.nav{flex-direction:row;overflow-x:auto;padding:8px 10px}.nav button{white-space:nowrap;padding:9px 13px}
  .tb{height:56px;padding:0 14px}.wrap{padding:20px 14px 40px}h1.pt{font-size:22px}}
 @media(max-width:520px){.g2{grid-template-columns:1fr}}
+.dk h3{margin:24px 0 8px;font-size:16px}.dk p,.dk li{line-height:1.9;font-size:14px}.dk ol,.dk ul{padding-right:22px;margin:6px 0}
+.dk code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}.dk p code,.dk li code,.dk td code{background:rgba(130,160,255,.13);padding:1px 6px;border-radius:5px;direction:ltr;unicode-bidi:embed}
+.dk .cb{position:relative;margin:8px 0}.dk pre{direction:ltr;text-align:left;background:#050a16;border:1px solid var(--line);border-radius:10px;padding:12px;overflow:auto;line-height:1.6;margin:0}.dk .cp{position:absolute;top:6px;left:6px;z-index:1;opacity:.85}
+.dk .ep{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin:12px 0;background:var(--card)}.dk .m{display:inline-block;min-width:54px;text-align:center;font-weight:700;border-radius:6px;padding:1px 8px;margin-left:8px;font-size:12px;direction:ltr}
+.dk .m.get{background:rgba(52,211,153,.18);color:var(--ok)}.dk .m.post{background:rgba(79,124,255,.2);color:#8fb0ff}.dk .m.del{background:rgba(248,113,113,.18);color:var(--bad)}
+.dk table{width:100%;border-collapse:collapse;font-size:13px;margin:6px 0}.dk td,.dk th{border-bottom:1px solid var(--line);padding:6px 8px;text-align:right;vertical-align:top}.dk th{color:var(--mut);font-weight:600}
 </style></head><body><div id="app"></div><div id="toast"></div>
 <script>
 const $=s=>document.querySelector(s);
@@ -4953,6 +5559,7 @@ async function api(p,m='GET',b){const r=await fetch(BASE+'/api'+p,{method:m,head
 async function act(fn,msg){try{const r=await fn();if(r&&r.warn)toast(r.warn,1);else if(msg)toast(msg);await load();return true}catch(e){toast(e.message,1);return false}}
 function copy(t){if(navigator.clipboard&&isSecureContext)navigator.clipboard.writeText(t);else{const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove()}toast('کپی شد')}
 const IC={
+ api:'<path d="m16 18 6-6-6-6M8 6l-6 6 6 6"/>',
  tun:'<path d="M3 20V11a9 9 0 0 1 18 0v9"/><path d="M7 20v-8a5 5 0 0 1 10 0v8M3 20h18"/>',
  users:'<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/>',
  layers:'<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
@@ -4974,10 +5581,11 @@ function showLogin(){staStop();$('#app').innerHTML=`<div class="login"><div clas
  $('#lp').onkeydown=e=>{if(e.key==='Enter')doLogin()}}
 async function doLogin(){try{await api('/login','POST',{u:$('#lu').value,p:$('#lp').value});load()}catch(e){toast(e.message,1)}}
 async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1)}}
-const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad']};
+const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad'],key:['غیرفعال (سقف کلید)','bad']};
 const NAV=[['sta','وضعیت','pulse','وضعیت لحظه‌ای سرور و وایرگارد: CPU، رم، دیسک، سرعت شبکه و اتصال‌ها.'],['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['nod','نودها','server','نود = سرور جداگانه با لوکیشن خودش. اینباندهای VLESS روی هر نود ساخته می‌شوند و همه در یک لینک ساب جمع می‌شوند.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
+NAV.push(['api','API و مستندات','api','اتصال پنل به ربات تلگرام یا سایت برای فروش خودکار: کلید API بسازید و طبق مستندات زیر کلاینت بسازید، تمدید کنید و لینک اشتراک را تحویل بدهید.']);
 NAV.push(['tun','تانل','tun','ساخت و مدیریت تانل BackPack بین سرور ایران و خارج؛ هر سمت می‌تواند همین سرور، یکی از نودها یا سرور دیگری با SSH باشد.']);
-const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.']];
+const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.'],['api','API و مستندات','api','کلید API خودتان را بسازید، سقف حجم و زمانش را کم و زیاد کنید و ربات یا سایتتان را وصل کنید؛ مصرف فقط از کلاینت‌هایی که با همان کلید ساخته می‌شوند کم می‌شود.']];
 const isA=()=>S&&S.role==='admin';
 function render(){
  const NV=isA()?NAV_A:NAV;if(!NV.find(n=>n[0]==TAB))TAB='cli';
@@ -4990,8 +5598,42 @@ function render(){
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
  <div class="st"><span class="si bl">${ic('pulse')}</span><span class="l">آنلاین</span><b>${on}</b></div>
  <div class="st"><span class="si o">${ic('db')}</span><span class="l">مصرف کل</span><b>${fmtB(tot)}</b></div></div>
- ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():TAB=='tun'?tunHTML():TAB=='nod'?nodHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
+ ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():TAB=='api'?apiHTML():TAB=='tun'?tunHTML():TAB=='nod'?nodHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
 async function logout(){await api('/logout','POST');showLogin()}
+/* ---------- API و مستندات ---------- */
+let APK=null,APD=null;
+const apiDt=t=>t?new Date(t*1000).toLocaleString('fa-IR'):'هرگز';
+const KST={active:['فعال','ok'],disabled:['غیرفعال','bad'],expired:['منقضی','bad'],limit:['اتمام حجم','bad']};
+function apiHTML(){setTimeout(apiLoad,0);return `<div class="bar2"><span class="mut sm">کلید API به ربات تلگرام یا سایت شما اجازه می‌دهد کلاینت بسازد، تمدید کند و لینک اشتراک را تحویل بدهد.</span><button class="p" onclick="apiNew()">+ کلید جدید</button></div><div id="apiBox">${apiBody()}</div><div id="apiDoc" class="dk">${APD||'<div class="empty">در حال بارگذاری مستندات…</div>'}</div>`}
+async function apiLoad(){if(TAB!=='api')return;try{APK=await api('/apikeys')}catch(e){toast(e.message,1);return}const b=$('#apiBox');if(b)b.innerHTML=apiBody();
+ if(!APD){try{APD=(await api('/docs')).html}catch(e){toast(e.message,1);return}const d=$('#apiDoc');if(d)d.innerHTML=APD}}
+function apiBody(){if(!APK)return '';return APK.keys.map(k=>{const st=KST[k.state]||[k.state,''],pct=k.limit_bytes?Math.min(100,k.used_bytes*100/k.limit_bytes):0;
+ return `<article class="card ${k.state=='active'?'up':''}"><div class="row"><h3>${esc(k.name)}<small dir="ltr">${esc(k.prefix)}…</small></h3><span class="b ${st[1]}">${st[0]}</span></div>${k.limit_bytes?`<div class="pg"><i style="width:${pct}%"></i></div>`:''}
+ <div class="meta">${isA()?'':`<span>حساب: <b>${esc(k.account)}</b></span>`}<span>کلاینت‌های ساخته‌شده: <b>${k.clients}</b></span><span>مصرف: <b>${fmtB(k.used_bytes)}</b> / <b>${k.limit_bytes?fmtB(k.limit_bytes):'نامحدود'}</b></span><span>باقی‌مانده: <b>${k.limit_bytes?fmtB(Math.max(0,k.limit_bytes-k.used_bytes)):'نامحدود'}</b></span><span>انقضا: <b style="direction:rtl">${k.expiry?apiDt(k.expiry):'بدون انقضا'}</b></span><span>آخرین استفاده: <b>${apiDt(k.last_used)}</b></span></div>
+ <div class="acts"><button class="s" onclick="apiEdit(${k.id})">ویرایش سهمیه</button><button class="s" onclick="apiTog(${k.id})">${k.enabled?'غیرفعال‌سازی':'فعال‌سازی'}</button><button class="s d" onclick="apiDel(${k.id})">حذف</button></div></article>`}).join('')||'<div class="empty">هنوز کلیدی نساخته‌اید.</div>'}
+function apiNew(){const ads=isA()?[]:(S.admins||[]).filter(a=>a.enabled);
+ const m=modal(`<h2>کلید API جدید</h2><div id="apF"><div class="g2"><div class="fg"><label>نام کلید (مثلاً ربات تلگرام)</label><input id="ap_nm"></div>
+ ${isA()?'':`<div class="fg"><label>این کلید با کدام حساب کار کند؟</label><select id="ap_ad"><option value="0">مدیر اصلی — دسترسی کامل به همه‌ی کلاینت‌ها</option>${ads.map(a=>`<option value="${a.id}">ادمین: ${esc(a.username)} — فقط کلاینت‌های خودش</option>`).join('')}</select></div>`}
+ <div class="fg"><label>سقف حجم این کلید (گیگ، 0 = نامحدود)</label><input id="ap_gb" dir="ltr" value="0"></div><div class="fg"><label>اعتبار کلید (روز، 0 = بدون انقضا)</label><input id="ap_dy" dir="ltr" value="0"></div></div>
+ <small class="mut">مصرف این سقف فقط از کلاینت‌هایی کم می‌شود که با همین کلید ساخته شوند. بعداً هر وقت خواستید سقف را کم و زیاد کنید.${isA()?'':' برای ربات فروش بهتر است یک ادمین جدا با سقف حجم و زمان بسازید و کلید را به او وصل کنید.'}</small></div>
+ <div class="mfoot"><button class="s" id="ap_c">بستن</button><button class="p" id="ap_s">ساخت کلید</button></div>`);
+ m.querySelector('#ap_c').onclick=()=>{m.remove();apiLoad()};
+ m.querySelector('#ap_s').onclick=async()=>{const g=i=>m.querySelector('#'+i);try{const r=await api('/apikeys','POST',{name:g('ap_nm').value.trim(),admin_id:g('ap_ad')?g('ap_ad').value:0,limit_gb:g('ap_gb').value,days:g('ap_dy').value});
+  g('apF').innerHTML=`<div class="b ok">کلید ساخته شد. همین حالا کپی کنید؛ دوباره نمایش داده نمی‌شود.</div><pre dir="ltr" style="user-select:all;word-break:break-all;white-space:pre-wrap;margin:10px 0;padding:10px;background:#050a16;border-radius:8px">${esc(r.key)}</pre><button class="s" onclick="copy('${esc(r.key)}')">کپی کلید</button>`;g('ap_s').remove()}catch(e){toast(e.message,1)}}}
+function apiEdit(id){const k=APK.keys.find(x=>x.id==id);if(!k)return;
+ const m=modal(`<h2>سهمیه‌ی کلید «${esc(k.name)}»</h2><div class="g2"><div class="fg"><label>نام کلید</label><input id="ae_nm" value="${esc(k.name)}"></div>
+ <div class="fg"><label>سقف حجم (گیگ، 0 = نامحدود)</label><input id="ae_gb" dir="ltr" value="${k.limit_bytes?+(k.limit_bytes/1073741824).toFixed(2):0}"><small>مصرف فعلی: ${fmtB(k.used_bytes)}</small></div>
+ <div class="fg"><label>اضافه / کم کردن حجم (گیگ، منفی = کم)</label><input id="ae_ag" dir="ltr" placeholder="مثلاً 50 یا -10"></div>
+ <div class="fg"><label>اضافه / کم کردن روز (منفی = کم)</label><input id="ae_ad" dir="ltr" placeholder="مثلاً 30 یا -5"><small>انقضای فعلی: ${k.expiry?apiDt(k.expiry):'بدون انقضا'}</small></div></div>
+ <label class="chk"><span>مصرف کلید صفر شود</span><input type="checkbox" id="ae_ru"></label>
+ <small class="mut" style="display:block;margin-top:8px">اگر هم «سقف حجم» و هم «اضافه/کم» را پر کنید، اول سقف جدید گذاشته و بعد تغییر اعمال می‌شود. با تمام شدن سقف، کلاینت‌های ساخته‌شده با این کلید قطع می‌شوند و با افزایش سقف خودکار وصل می‌شوند.</small>
+ <div class="mfoot"><button class="s" id="ae_c">بستن</button><button class="p" id="ae_s">ذخیره</button></div>`);
+ m.querySelector('#ae_c').onclick=()=>m.remove();
+ m.querySelector('#ae_s').onclick=async()=>{const g=i=>m.querySelector('#'+i).value.trim();const b={name:g('ae_nm'),limit_gb:g('ae_gb'),reset_usage:m.querySelector('#ae_ru').checked};
+  if(g('ae_ag'))b.add_gb=g('ae_ag');if(g('ae_ad'))b.add_days=g('ae_ad');
+  try{const r=await api('/apikeys/'+id,'PUT',b);toast(r.warn||'ذخیره شد',!!r.warn);m.remove();apiLoad()}catch(e){toast(e.message,1)}}}
+async function apiTog(id){try{await api('/apikeys/'+id+'/toggle','POST');apiLoad()}catch(e){toast(e.message,1)}}
+async function apiDel(id){if(!confirm('این کلید حذف شود؟ هر ربات یا سایتی که از آن استفاده می‌کند از کار می‌افتد؛ کلاینت‌های ساخته‌شده می‌مانند.'))return;try{await api('/apikeys/'+id,'DELETE');apiLoad()}catch(e){toast(e.message,1)}}
 /* ---------- تانل (BackPack) ---------- */
 let TUN=null,TUNT=null;
 const TPH={online:['آنلاین','ok'],ready:['برقرار شد','warn'],down:['قطع','bad']};
