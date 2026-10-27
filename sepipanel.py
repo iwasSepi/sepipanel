@@ -156,6 +156,7 @@ _db.execute("""CREATE TABLE IF NOT EXISTS api_keys(
   id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, key_hash TEXT UNIQUE, prefix TEXT, admin_id INTEGER DEFAULT 0,
   enabled INTEGER DEFAULT 1, created INTEGER, last_used INTEGER DEFAULT 0)""")
 ensure_cols("api_keys", {"limit_bytes": "INTEGER DEFAULT 0", "used_bytes": "INTEGER DEFAULT 0", "expiry": "INTEGER DEFAULT 0"})
+ensure_cols("clients", {"max_users": "INTEGER DEFAULT 0"})       # حداکثر کاربر همزمان (۰ = نامحدود)
 ensure_cols("clients", {"key_id": "INTEGER DEFAULT 0"})       # کلید API که این کلاینت را ساخته (0 = از پنل)
 try:
     _db.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_clients_ext ON clients(owner_id, ext_id) WHERE ext_id!=''")
@@ -921,7 +922,7 @@ XRAY_DEFAULT = dict(listen="0.0.0.0", transport="tcp", security="reality", flow=
                     min_ver="1.2", reject_sni=0, allow_insecure=0, path="/", host="", service_name="", authority="",
                     multi_mode=0, xhttp_mode="auto", tcp_header="none", kcp_header="none", kcp_seed="",
                     fallback_dest="", fallback_xver=0, sniffing=1, route_only=0, block_bt=0, block_private=0,
-                    domain_strategy="AsIs", tfo=0, extra_stream="")
+                    domain_strategy="AsIs", tfo=0, extra_stream="", custom_sub=0)
 PRIVATE_CIDRS = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
                  "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10"]
 
@@ -1248,6 +1249,7 @@ def parse_vless(d, cur=None):
     o["fallback_xver"] = num(g("fallback_xver"), 0, 0, 2, "xver")
     o["sniffing"], o["route_only"] = flag("sniffing"), flag("route_only")
     o["block_bt"], o["block_private"], o["tfo"] = flag("block_bt"), flag("block_private"), flag("tfo")
+    o["custom_sub"] = flag("custom_sub")
     o["domain_strategy"] = strv("domain_strategy") or "AsIs"
     if o["domain_strategy"] not in ("AsIs", "UseIP", "UseIPv4", "UseIPv6"):
         raise Err("domainStrategy نامعتبر است")
@@ -1346,8 +1348,8 @@ def xray_build(ib):
     if o["block_private"]:
         rules.append({"type": "field", "ip": PRIVATE_CIDRS, "outboundTag": "block"})
     return {"log": {"loglevel": "warning"}, "stats": {},
-            "api": {"tag": "api", "services": ["StatsService", "HandlerService"]},
-            "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True}}},
+            "api": {"tag": "api", "services": ["StatsService", "HandlerService", "RoutingService"]},
+            "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}}},
             "inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": aport, "protocol": "dokodemo-door",
                           "settings": {"address": "127.0.0.1"}}, inbound],
             "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": o["domain_strategy"]}},
@@ -1541,6 +1543,65 @@ def vless_link(c, ci, ib):
         P.append(("packetEncoding", o["packet_encoding"]))
     return (f"vless://{ci['vuuid']}@{host}:{ib['endpoint_port'] or ib['port']}?" + "&".join(f"{k}={v}" for k, v in P)
             + "#" + quote(f"{c['name']}-{ib['name']}"))
+
+
+def is_custom_sub(ib):
+    return is_vless(ib) and bool(xcfg_of(ib).get("custom_sub"))
+
+
+def vless_client_config(c, ci, ib):
+    """کانفیگ کامل Xray (مثل «Custom config» در v2rayNG) برای یک کلاینت"""
+    o = xcfg_of(ib)
+    t, sec = o["transport"], o["security"]
+    host = ep_host(ib).strip("[]")
+    user = {"id": ci["vuuid"], "encryption": "none", "level": 0}
+    if sec != "none" and o["flow"]:
+        user["flow"] = o["flow"]
+    ss = {"network": t, "security": sec}
+    if t == "tcp" and o["tcp_header"] == "http":
+        ss["tcpSettings"] = {"header": {"type": "http", "request": {"path": [o["path"] or "/"],
+                                                                      "headers": {"Host": [h for h in _comma(o["host"])]}}}}
+    elif t == "ws":
+        ss["wsSettings"] = {"path": o["path"] or "/", "headers": ({"Host": o["host"]} if o["host"] else {})}
+    elif t == "httpupgrade":
+        ss["httpupgradeSettings"] = {"path": o["path"] or "/", "host": o["host"]}
+    elif t == "xhttp":
+        ss["xhttpSettings"] = {"path": o["path"] or "/", "host": o["host"], "mode": o["xhttp_mode"]}
+    elif t == "grpc":
+        ss["grpcSettings"] = {"serviceName": o["service_name"], "multiMode": bool(o["multi_mode"]),
+                              **({"authority": o["authority"]} if o["authority"] else {})}
+    elif t == "kcp":
+        ss["kcpSettings"] = {"header": {"type": o["kcp_header"]}, **({"seed": o["kcp_seed"]} if o["kcp_seed"] else {})}
+    if sec == "tls":
+        tl = {"serverName": o["sni"] or host, "allowInsecure": bool(o["allow_insecure"])}
+        if o["fp"]:
+            tl["fingerprint"] = o["fp"]
+        if o["alpn"]:
+            tl["alpn"] = _comma(o["alpn"])
+        if o["tls_mode"] == "self" and pki_of(ib).get("tls_pcs"):
+            tl["pinnedPeerCertSha256"] = pki_of(ib)["tls_pcs"]
+        ss["tlsSettings"] = tl
+    elif sec == "reality":
+        ss["realitySettings"] = {"serverName": _comma(o["server_names"])[0], "fingerprint": o["fp"] or "chrome",
+                                 "publicKey": o["reality_pub"], "shortId": (_comma(o["short_ids"]) or [""])[0],
+                                 "spiderX": o["spider_x"] or "/"}
+    sniff = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"], "routeOnly": False}
+    return {
+        "remarks": f"{c['name']}-{ib['name']}",
+        "log": {"access": "", "error": "", "loglevel": "warning"},
+        "inbounds": [
+            {"tag": "socks", "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "sniffing": sniff,
+             "settings": {"auth": "noauth", "udp": True, "allowTransparent": False}},
+            {"tag": "http", "port": 10809, "listen": "127.0.0.1", "protocol": "http", "sniffing": sniff,
+             "settings": {"allowTransparent": False}}],
+        "outbounds": [
+            {"tag": "proxy", "protocol": "vless",
+             "settings": {"vnext": [{"address": host, "port": int(ib["endpoint_port"] or ib["port"]), "users": [user]}]},
+             "streamSettings": ss, "mux": {"enabled": False, "concurrency": -1}},
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}}],
+        "dns": {"servers": ["1.1.1.1", "8.8.8.8"]},
+        "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}]}}
 
 
 # ------------------------------ OpenVPN (سرویس openvpn-server@<name>) ------------------------------
@@ -2215,7 +2276,8 @@ def parse_client_basic(d):
     if rp not in ("", "daily", "weekly", "monthly"):
         raise Err("بازه ریست ترافیک نامعتبر است")
     return dict(name=name, note=str(d.get("note") or "")[:500], limit_bytes=int(max(gb, 0) * 1024 ** 3),
-                expiry=num(d.get("expiry"), 0, 0, None, "تاریخ انقضا"), reset_period=rp)
+                expiry=num(d.get("expiry"), 0, 0, None, "تاریخ انقضا"), reset_period=rp,
+                max_users=num(d.get("max_users"), 0, 0, 1000, "تعداد کاربر همزمان"))
 
 
 def save_links(cid, links):
@@ -2295,6 +2357,298 @@ def collect_stats():
         w = apply_many(changed)
         if w:
             log.warning(w)
+
+
+# ------------------------------ محدودیت کاربر همزمان (همهٔ پروتکل‌ها) ------------------------------
+# VLESS: آی‌پی‌های آنلاین از Xray (روی همین سرور و روی نودها) → آی‌پی اضافه با rule مسیریابی فقط برای همان کاربر بلاک می‌شود
+# WireGuard/AmneziaWG: پیِر با دو آی‌پی که مدام جابه‌جا می‌شود = اشتراک‌گذاری؛ آی‌پی اضافه با iptables روی پورت UDP بلاک می‌شود
+# L2TP: نشست‌های PPP هم‌نام؛ نشست‌های اضافه (جدیدترین‌ها) قطع می‌شوند
+# OpenVPN: هر حساب یک گواهی دارد و سرور (بدون duplicate-cn) همیشه فقط یک نشست برای هر حساب نگه می‌دارد
+LIM_SECS = 60          # مدت بلاک آی‌پی اضافه (تا وقتی هنوز تلاش می‌کند تمدید می‌شود)
+LIM_INTERVAL = 5
+LIM_TAG = "sepi-lim"
+LIM = {"allowed": {}, "blocked": {}, "wg": {}, "wgb": {}}   # allowed[cid]=[ip]  blocked[(cid,ip)]={until,ibs}
+NODE_ONLINE = {}       # id اینباندِ نود → (زمان، users) از آخرین probe
+
+
+def limit_plan(max_users, allowed, current):
+    """آی‌پی‌هایی که از قبل آنلاین‌اند جا را نگه می‌دارند؛ بقیه فقط اگر جا باشد پذیرفته می‌شوند"""
+    allowed = [ip for ip in allowed if ip in current]
+    excess = []
+    for ip in sorted(current):
+        if ip in allowed:
+            continue
+        if len(allowed) < max_users:
+            allowed.append(ip)
+        else:
+            excess.append(ip)
+    return allowed, excess
+
+
+def wg_observe(st, ip, t):
+    """st: وضعیت یک کلاینت وایرگارد؛ هر بار آی‌پیِ endpoint فعلی را ثبت می‌کند"""
+    st["seen"] = {k: v for k, v in st.get("seen", {}).items() if v[1] > t - 60}
+    st["seen"].setdefault(ip, [t, t])[1] = t
+    if st.get("last") and st["last"] != ip:
+        st.setdefault("flips", []).append(t)
+    st["last"] = ip
+    st["flips"] = [f for f in st.get("flips", []) if f > t - 60]
+
+
+def wg_excess(st, mx):
+    """جابه‌جایی‌های پشت‌سرهم (حداقل ۲ بار در ۶۰ ثانیه) = چند دستگاه هم‌زمان؛ قدیمی‌ترین آی‌پی‌ها می‌مانند"""
+    if len(st.get("flips", [])) < 2:
+        return []
+    ips = sorted(st["seen"], key=lambda i: st["seen"][i][0])
+    return ips[mx:]
+
+
+def _xray_aport(ib):
+    try:
+        return json.loads(_read(xray_path(ib)) or "")["inbounds"][0]["port"]
+    except Exception:
+        return None
+
+
+def _rule_json(ib, cid, ip):
+    return json.dumps({"routing": {"rules": [{"ruleTag": f"lim-{cid}-{ip}", "type": "field",
+                                              "user": [xray_email(cid, ib["id"])], "source": [ip], "outboundTag": "block"}]}})
+
+
+def _node_xray(ib, args, rule=None):
+    n = q("SELECT * FROM nodes WHERE id=?", (ib_node(ib),), True)
+    if not n:
+        return False
+    xb, path = shlex.quote(n["xray_bin"] or XRAY_BIN), shlex.quote(xray_path(ib))
+    sc = (f"P=$(grep -m1 -o '\"port\": *[0-9]*' {path} 2>/dev/null | grep -o '[0-9]*$'); [ -n \"$P\" ] || exit 1; ")
+    if rule is not None:
+        sc += f"T=$(mktemp); printf '%s' {shlex.quote(rule)} > \"$T\"; {xb} api {args} -s=127.0.0.1:$P \"$T\"; R=$?; rm -f \"$T\"; exit $R"
+    else:
+        sc += f"{xb} api {args} -s=127.0.0.1:$P"
+    try:
+        return node_call(n, lambda s: s.run(sc, timeout=30))[0] == 0
+    except Exception as e:
+        log.warning("limit node: %s", e)
+        return False
+
+
+def xray_block_ip(ib, cid, ip):
+    if ib_node(ib):
+        return _node_xray(ib, "adrules -append", _rule_json(ib, cid, ip))
+    ap = _xray_aport(ib)
+    if not ap:
+        return False
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        f.write(_rule_json(ib, cid, ip))
+        tmp = f.name
+    try:
+        return run([xray_bin(), "api", "adrules", f"-s=127.0.0.1:{ap}", "-append", tmp], timeout=10)[0] == 0
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def xray_unblock_ip(ib, cid, ip):
+    if ib_node(ib):
+        _node_xray(ib, f"rmrules {shlex.quote(f'lim-{cid}-{ip}')}")
+        return
+    ap = _xray_aport(ib)
+    if ap:
+        run([xray_bin(), "api", "rmrules", f"-s=127.0.0.1:{ap}", f"lim-{cid}-{ip}"], timeout=10)
+
+
+def _ipt(ip, port, add):
+    """DROP یودی‌پی‌ی آی‌پی روی پورت وایرگارد (فقط INPUT همین سرور)"""
+    exe = "ip6tables" if ":" in ip else "iptables"
+    r = ["INPUT", "-s", ip, "-p", "udp", "--dport", str(port), "-m", "comment", "--comment", LIM_TAG, "-j", "DROP"]
+    exists = run([exe, "-C"] + r, timeout=8)[0] == 0
+    if add and not exists:
+        return run([exe, "-I"] + r, timeout=8)[0] == 0
+    if not add and exists:
+        run([exe, "-D"] + r, timeout=8)
+    return True
+
+
+def lim_cleanup_rules():
+    """بعد از ری‌استارت پنل، بلاک‌های قبلی پاک شوند"""
+    for exe in ("iptables", "ip6tables"):
+        rc, out, _ = run([exe, "-S", "INPUT"], timeout=8)
+        if rc != 0:
+            continue
+        for ln in out.splitlines():
+            if LIM_TAG in ln and ln.startswith("-A "):
+                run([exe, "-D"] + shlex.split(ln[3:]), timeout=8)
+
+
+def _online_from(users, ib, limited, online):
+    for u in users or []:
+        m = re.fullmatch(r"(\d+)-(\d+)@sp", u.get("email", ""))
+        if not m or int(m.group(2)) != ib["id"] or int(m.group(1)) not in limited:
+            continue
+        for e in u.get("ips") or []:
+            if e.get("ip"):
+                online.setdefault(int(m.group(1)), {}).setdefault(e["ip"], set()).add(ib["id"])
+
+
+def _enforce_vless(limited, t):
+    ibs, online = {}, {}
+    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='vless'"):
+        if ib_node(ib):
+            c = NODE_ONLINE.get(ib["id"])
+            if not c or t - c[0] > 45 or not xray_up(ib):
+                continue
+            ibs[ib["id"]] = ib
+            _online_from(c[1], ib, limited, online)
+            continue
+        if not xray_bin() or not xray_up(ib):
+            continue
+        ap = _xray_aport(ib)
+        if not ap:
+            continue
+        ibs[ib["id"]] = ib
+        rc, out, _ = run([xray_bin(), "api", "statsonlineiplist", f"-s=127.0.0.1:{ap}", "-all"], timeout=8)
+        if rc != 0:
+            continue
+        try:
+            _online_from(json.loads(out or "{}").get("users"), ib, limited, online)
+        except Exception:
+            continue
+    for cid, mx in limited.items():
+        cur = online.get(cid, {})
+        allowed, excess = limit_plan(mx, LIM["allowed"].get(cid, []), set(cur))
+        LIM["allowed"][cid] = allowed
+        linked = {r["inbound_id"] for r in q("SELECT inbound_id FROM client_inbound WHERE client_id=?", (cid,))}
+        for ip in excess:
+            rec = LIM["blocked"].get((cid, ip))
+            if not rec:
+                rec = LIM["blocked"][(cid, ip)] = {"ibs": set(), "until": 0}
+                log.info("limit: client %s over %s users — blocking %s", cid, mx, ip)
+            for iid in linked & set(ibs):
+                if iid not in rec["ibs"] and xray_block_ip(ibs[iid], cid, ip):
+                    rec["ibs"].add(iid)
+            rec["until"] = t + LIM_SECS
+    for key in list(LIM["blocked"]):
+        cid, ip = key
+        rec = LIM["blocked"][key]
+        if (cid not in limited or ip in LIM["allowed"].get(cid, []) or rec["until"] < t
+                or len(LIM["allowed"].get(cid, [])) < limited[cid]):      # جای خالی شد → بلاک برداشته شود
+            for iid in rec["ibs"]:
+                if iid in ibs:
+                    xray_unblock_ip(ibs[iid], cid, ip)
+            del LIM["blocked"][key]
+    for cid in [c for c in LIM["allowed"] if c not in limited]:
+        del LIM["allowed"][cid]
+
+
+def _enforce_wg(limited, t):
+    pubs = {r["public_key"]: r["id"] for r in q("SELECT id, public_key FROM clients WHERE max_users>0 AND enabled=1")}
+    ibs = [ib for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='wg'")] if pubs or LIM["wgb"] else []
+    seen_on = {}                                   # (cid, ip) -> {(iid, port)}
+    eps_by_ib = {}
+    for ib in ibs:
+        rc, out, _ = run([tools(ib)[0], "show", ib["name"], "dump"], timeout=8)
+        if rc != 0:
+            continue
+        eps = {}
+        for ln in out.strip().splitlines()[1:]:
+            f = ln.split("\t")
+            if len(f) < 8 or f[2] in ("", "(none)"):
+                continue
+            ip = f[2].rpartition(":")[0].strip("[]")
+            eps[f[0]] = ip
+            cid = pubs.get(f[0])
+            if cid and int(f[4] or 0) and t - int(f[4]) < 200:
+                wg_observe(LIM["wg"].setdefault(cid, {}), ip, t)
+                seen_on.setdefault((cid, ip), set()).add((ib["id"], ib["port"]))
+        eps_by_ib[ib["id"]] = eps
+    for cid, mx in limited.items():
+        st = LIM["wg"].get(cid)
+        if not st:
+            continue
+        for ip in wg_excess(st, mx):
+            rec = LIM["wgb"].get((cid, ip))
+            if not rec:
+                rec = LIM["wgb"][(cid, ip)] = {"rules": set(), "until": 0}
+            for iid, port in seen_on.get((cid, ip), set()):
+                if (iid, port) in rec["rules"]:
+                    continue
+                mine = {k for k, v in pubs.items() if v == cid}
+                if any(e == ip and k not in mine for k, e in eps_by_ib.get(iid, {}).items()):
+                    continue                         # آی‌پی با کلاینت دیگری (پشت یک NAT) مشترک است → بلاک نشود تا بی‌گناه قطع نشود
+                if _ipt(ip, port, True):
+                    rec["rules"].add((iid, port))
+                    log.info("limit: wg client %s over %s devices — blocking %s", cid, mx, ip)
+            rec["until"] = t + LIM_SECS
+    for key in list(LIM["wgb"]):
+        cid, ip = key
+        rec = LIM["wgb"][key]
+        if cid not in limited or rec["until"] < t:
+            for iid, port in rec["rules"]:
+                _ipt(ip, port, False)
+            del LIM["wgb"][key]
+            LIM["wg"].pop(cid, None)
+    for cid in [c for c in LIM["wg"] if c not in limited]:
+        del LIM["wg"][cid]
+
+
+def ppp_all_sessions():
+    """{username: [(زمان ساخت، iface)]}؛ برخلاف ppp_sessions همهٔ نشست‌های هم‌نام را نگه می‌دارد"""
+    out = {}
+    live = {ln.split(":")[0].strip() for ln in (_read("/proc/net/dev") or "").splitlines()[2:]}
+    try:
+        names = os.listdir(PPP_RUN)
+    except OSError:
+        return out
+    for nm in names:
+        if nm not in live:
+            continue
+        u = (_read(os.path.join(PPP_RUN, nm)) or "").strip()
+        if u:
+            try:
+                out.setdefault(u, []).append((os.path.getmtime(os.path.join(PPP_RUN, nm)), nm))
+            except OSError:
+                pass
+    return out
+
+
+def _enforce_l2tp(limited, t):
+    if not any(is_l2tp(i) for i in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='l2tp'")):
+        return
+    sess = ppp_all_sessions()
+    for r in q("SELECT client_id, l2tp_user FROM client_inbound WHERE l2tp_user!=''"):
+        mx = limited.get(r["client_id"])
+        ss = sorted(sess.get(r["l2tp_user"], []))
+        if mx and len(ss) > mx:
+            for _, iface in ss[mx:]:             # قدیمی‌ترین‌ها می‌مانند، جدیدترین‌ها قطع می‌شوند
+                log.info("limit: l2tp client %s over %s sessions — kicking %s", r["client_id"], mx, iface)
+                ppp_kick(iface)
+
+
+def enforce_limits():
+    limited = {r["id"]: r["max_users"] for r in q("SELECT id, max_users FROM clients WHERE max_users>0 AND enabled=1")}
+    if not limited and not LIM["blocked"] and not LIM["wgb"]:
+        return
+    t = time.time()
+    for fn in (_enforce_vless, _enforce_wg, _enforce_l2tp):
+        try:
+            fn(limited, t)
+        except Exception:
+            log.exception("limits %s", fn.__name__)
+
+
+def limit_loop():
+    try:
+        lim_cleanup_rules()
+    except Exception:
+        log.exception("limits cleanup")
+    while True:
+        try:
+            enforce_limits()
+        except Exception:
+            log.exception("limits")
+        time.sleep(LIM_INTERVAL)
 
 
 def stats_loop():
@@ -2451,9 +2805,14 @@ def ser_client(c):
     links = q("""SELECT ci.*, ib.name AS ib_name, ib.proto AS ib_proto FROM client_inbound ci JOIN inbounds ib ON ib.id=ci.inbound_id
                  WHERE ci.client_id=? ORDER BY ib.id""", (c["id"],))
     d = {k: c[k] for k in ("id", "name", "token", "enabled", "reason", "public_key", "limit_bytes", "up_bytes",
-                           "down_bytes", "expiry", "note", "created", "last_seen", "reset_period", "owner_id", "ext_id")}
+                           "down_bytes", "expiry", "note", "created", "last_seen", "reset_period", "owner_id", "ext_id", "max_users")}
     d["state"] = client_state(c)
     d["sub_url"] = f"{base_url()}/sub/{c['token']}"
+    d["custom_sub_url"] = ""
+    for l_ in links:
+        if l_["ib_proto"] == "vless" and l_["vuuid"] and is_custom_sub(q("SELECT * FROM inbounds WHERE id=?", (l_["inbound_id"],), True)):
+            d["custom_sub_url"] = f"{base_url()}/sub/{c['token']}/custom"
+            break
     d["online"] = any(l["last_hs"] and now() - l["last_hs"] < 180 for l in links)
     d["links"] = [dict(inbound_id=l["inbound_id"], ib_name=l["ib_name"], ip4=l["ip4"], ip6=l["ip6"],
                        allowed_ips=l["allowed_ips"], keepalive=l["keepalive"], dns=l["dns"], mtu=l["mtu"],
@@ -3780,7 +4139,8 @@ def node_probe(n):
             f"if systemctl is-active --quiet {unit}; then echo 1; "
             f"P=$(grep -m1 -o '\"port\": *[0-9]*' {path} 2>/dev/null | grep -o '[0-9]*$'); "
             f"if [ -n \"$P\" ]; then {qx} api statsquery -s=127.0.0.1:$P -pattern 'user>>>' -reset=true 2>/dev/null || echo '{{}}'; "
-            f"else echo '{{}}'; fi; else echo 0; fi")
+            f"else echo '{{}}'; fi; echo '@@O'; "
+            f"[ -n \"$P\" ] && {qx} api statsonlineiplist -s=127.0.0.1:$P -all 2>/dev/null; else echo 0; fi")
     rc, out, err = node_call(n, lambda s: s.run("\n".join(parts), timeout=45))
     chunks = out.split("@@I ")
     m = re.search(r"@@V\s*\n([^\n]*)", chunks[0])
@@ -3793,6 +4153,12 @@ def node_probe(n):
         nm = nm.strip()
         flag, _, js = body_.partition("\n")
         up[nm] = flag.strip() == "1"
+        js, _, onl = js.partition("@@O")
+        if up[nm] and nm in ibs and onl.strip():
+            try:
+                NODE_ONLINE[ibs[nm]["id"]] = (time.time(), json.loads(onl).get("users") or [])
+            except Exception:
+                pass
         if up[nm] and nm in ibs and js.strip():
             _vless_ingest(ibs[nm], js)
     for nm in ibs:
@@ -4476,10 +4842,10 @@ def create_clients(d):
         priv = gen_private()
         name = b["name"] if count == 1 else f"{b['name']}-{i + 1}"
         try:
-            cid = x("""INSERT INTO clients(name,token,enabled,private_key,public_key,limit_bytes,expiry,note,created,reset_period,last_reset,owner_id,ext_id,key_id)
-                       VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?)""",
+            cid = x("""INSERT INTO clients(name,token,enabled,private_key,public_key,limit_bytes,expiry,note,created,reset_period,last_reset,owner_id,ext_id,key_id,max_users)
+                       VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (name, secrets.token_urlsafe(16), priv, pub_from_private(priv), b["limit_bytes"], b["expiry"], b["note"],
-                     now(), b["reset_period"], now(), owner, ext, kid))
+                     now(), b["reset_period"], now(), owner, ext, kid, b["max_users"]))
         except sqlite3.IntegrityError:        # دو درخواست هم‌زمان با یک external_id
             old = q("SELECT id FROM clients WHERE ext_id=? AND owner_id=?", (ext, owner), True) if ext else None
             if old:
@@ -4514,9 +4880,9 @@ def client_update(cid):
     if g.role == "admin":
         require_active_admin()
         links = admin_links(cid, links)
-    x("""UPDATE clients SET name=?, note=?, limit_bytes=?, expiry=?, reset_period=?,
+    x("""UPDATE clients SET name=?, note=?, limit_bytes=?, expiry=?, reset_period=?, max_users=?,
          last_reset=CASE WHEN reset_period!=? THEN ? ELSE last_reset END WHERE id=?""",
-      (b["name"], b["note"], b["limit_bytes"], b["expiry"], b["reset_period"], b["reset_period"], now(), cid))
+      (b["name"], b["note"], b["limit_bytes"], b["expiry"], b["reset_period"], b["max_users"], b["reset_period"], now(), cid))
     touched = save_links(cid, links)
     c = q("SELECT * FROM clients WHERE id=?", (cid,), True)
     if not c["enabled"] and c["reason"] in ("expired", "limit") and usage_state(c) == "active":
@@ -4693,11 +5059,14 @@ def v1_client_renew(cid):
     if d.get("add_days") not in (None, "", 0, "0"):
         n = num(d.get("add_days"), 0, -36500, 36500, "تعداد روز")
         exp, did = (max(exp, now()) if exp else now()) + n * 86400, True
+    mu = c["max_users"] or 0
+    if d.get("max_users") not in (None, ""):
+        mu, did = num(d.get("max_users"), 0, 0, 1000, "تعداد کاربر همزمان"), True
     reset = bool(d.get("reset_traffic"))
     if not (did or reset):
-        raise Err("حداقل یکی از add_gb ، add_days ، limit_gb ، days ، reset_traffic را بدهید")
+        raise Err("حداقل یکی از add_gb ، add_days ، limit_gb ، days ، max_users ، reset_traffic را بدهید")
     up, down = (0, 0) if reset else (c["up_bytes"], c["down_bytes"])
-    x("UPDATE clients SET limit_bytes=?, expiry=?, up_bytes=?, down_bytes=? WHERE id=?", (lim, exp, up, down, cid))
+    x("UPDATE clients SET limit_bytes=?, expiry=?, up_bytes=?, down_bytes=?, max_users=? WHERE id=?", (lim, exp, up, down, mu, cid))
     c2 = q("SELECT * FROM clients WHERE id=?", (cid,), True)
     if not c2["enabled"] and c2["reason"] in ("expired", "limit") and usage_state(c2) == "active":
         x("UPDATE clients SET enabled=1, reason='' WHERE id=?", (cid,))
@@ -4897,9 +5266,10 @@ def api_docs_html(base):
                         ("external_id", "شناسه‌ی سفارش شما (پیشنهاد قوی). اگر همین سفارش دوباره بیاید (مثلاً درگاه دوبار callback بزند) کلاینت تکراری ساخته نمی‌شود و همان قبلی با <code>existing: true</code> برمی‌گردد."),
                         ("note", "یادداشت دلخواه (مثلاً آیدی تلگرام خریدار)"),
                         ("reset_period", "<code>daily</code> / <code>weekly</code> / <code>monthly</code> برای ریست خودکار ترافیک؛ خالی = بدون ریست"),
+                        ("max_users", "حداکثر کاربر هم‌زمان؛ 0 یا نفرستادن = نامحدود. مثلاً <code>1</code> یعنی فقط یک دستگاه/آی‌پی هم‌زمان (توضیح کامل در بخش «محدودیت کاربر هم‌زمان»)"),
                         ("count", "تعداد کلاینت (پیش‌فرض 1، حداکثر 200)؛ با <code>external_id</code> فقط 1")],
                 ex='curl -X POST @@B@@/api/v1/clients \\\n  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\\n  -d \'{"name": "tg12345-1001", "limit_gb": 30, "days": 30, "inbounds": [1, 2], "external_id": "1001", "note": "tg:12345"}\'',
-                resp='{"ok": true, "existing": false, "warn": "",\n "clients": [{"id": 12, "name": "tg12345-1001", "state": "active", "enabled": 1,\n   "limit_bytes": 32212254720, "up_bytes": 0, "down_bytes": 0, "expiry": 1795000000,\n   "token": "Ab3xYz...", "sub_url": "@@B@@/sub/Ab3xYz...", "ext_id": "1001",\n   "links": [{"inbound_id": 2, "ib_name": "vless-de", "proto": "vless", "vlink": "vless://..."}]}]}'))
+                resp='{"ok": true, "existing": false, "warn": "",\n "clients": [{"id": 12, "name": "tg12345-1001", "state": "active", "enabled": 1,\n   "limit_bytes": 32212254720, "up_bytes": 0, "down_bytes": 0, "expiry": 1795000000,\n   "token": "Ab3xYz...", "sub_url": "@@B@@/sub/Ab3xYz...", "custom_sub_url": "", "ext_id": "1001", "max_users": 1,\n   "links": [{"inbound_id": 2, "ib_name": "vless-de", "proto": "vless", "vlink": "vless://..."}]}]}'))
     H.append(ep("GET", "/api/v1/clients", "لیست کلاینت‌ها (کلید ادمین فقط کلاینت‌های خودش را می‌بیند). برای نمایش وضعیت و مصرف به مشتری یا پیدا کردن کلاینت از روی سفارش.",
                 params=[("external_id", "پیدا کردن کلاینت یک سفارش"), ("name", "نام دقیق"), ("token", "توکن داخل لینک اشتراک (مشتری لینکش را بفرستد، شما کلاینتش را پیدا کنید)"),
                         ("q", "جستجو در نام و یادداشت (مثلاً آیدی تلگرام)"), ("limit / offset", "صفحه‌بندی؛ پیش‌فرض 50، حداکثر 200")],
@@ -4911,6 +5281,7 @@ def api_docs_html(base):
                 params=[("add_days", "به روز اضافه می‌کند؛ منفی = کم می‌کند. اگر اعتبار هنوز مانده، از انتهای همان حساب می‌شود وگرنه از الان"),
                         ("add_gb", "به سقف حجم اضافه می‌کند؛ منفی = کم می‌کند (کلاینت نامحدود با این گزینه محدود می‌شود)"),
                         ("limit_gb / days", "مقدار مطلق: سقف حجم را دقیقاً این عدد می‌گذارد (0 = نامحدود) و اعتبار را از همین الان این‌قدر روز می‌کند (0 = بدون انقضا)"),
+                        ("max_users", "تغییر سقف کاربر هم‌زمان (0 = نامحدود)"),
                         ("reset_traffic", "<code>true</code> = مصرف را صفر می‌کند. تمدید ماهانه‌ی معمول: <code>{\"add_days\": 30, \"reset_traffic\": true}</code>")],
                 ex='curl -X POST @@B@@/api/v1/clients/12/renew \\\n  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\\n  -d \'{"add_days": 30, "reset_traffic": true}\'',
                 resp='{"ok": true, "warn": "", "client": {…کلاینت به‌روز…}}'))
@@ -4921,6 +5292,13 @@ def api_docs_html(base):
     H.append(ep("DELETE", "/api/v1/clients/{id}", "کلاینت را برای همیشه حذف می‌کند.",
                 ex='curl -X DELETE -H "Authorization: Bearer $KEY" @@B@@/api/v1/clients/12'))
     H.append("<h3>لینک اشتراک (sub_url)</h3><p>همان <code>sub_url</code> را به مشتری بدهید. برنامه‌های کلاینت (V2Ray، Hiddify، Streisand، …) آن را به‌صورت اشتراک می‌خوانند و مرورگر یک صفحه‌ی زیبا با QR و آموزش نشان می‌دهد. پارامترهای اختیاری: <code>?format=raw</code> (لینک‌های خام)، <code>?format=json</code>، <code>?format=conf</code>، <code>?inbound=ID</code> (فقط یک اینباند). فایل تک‌تک: <code>/sub/&lt;token&gt;/&lt;inbound_id&gt;.conf</code> (یا <code>.ovpn</code>) و QR: <code>/sub/&lt;token&gt;/link.svg</code>. وقتی حجم/زمان کلاینت تمام شود لینک اشتراک 403 می‌دهد.</p>")
+    H.append("<h3>ساب کاستوم (کانفیگ کامل JSON برای VLESS)</h3><p>در تنظیمات هر اینباند VLESS (تب «VLESS») گزینه‌ی «ساب کاستوم» هست. اگر روشن باشد، آن اینباند از ساب معمولی خارج می‌شود و کانفیگ هر کلاینت به‌صورت یک کانفیگ کامل Xray (مثل «Custom config» در v2rayNG؛ با پراکسی محلی socks روی 10808 و http روی 10809) در لینک جداگانه‌ی <code>/sub/&lt;token&gt;/custom</code> می‌آید؛ خروجی یک آرایه‌ی JSON است و هر عضو <code>remarks</code> دارد. این لینک در پاسخ کلاینت‌ها با کلید <code>custom_sub_url</code> برمی‌گردد (اگر کلاینت هیچ اینباند کاستومی نداشته باشد خالی است). هدرهای حجم/زمان (<code>Subscription-Userinfo</code>) مثل ساب معمولی هستند و با اتمام حجم/زمان، پاسخ 403 می‌شود.</p>")
+    H.append("<h3>محدودیت کاربر هم‌زمان (max_users)</h3><p>مقدار <code>max_users</code> هر کلاینت (پیش‌فرض 0 = نامحدود) تعیین می‌کند چند نفر هم‌زمان می‌توانند با آن اشتراک وصل باشند. پنل هر ~5 ثانیه بررسی می‌کند و نفر اضافه را بلاک می‌کند؛ نفر(های) اول که قبلاً وصل بوده‌اند می‌مانند. رفتار هر پروتکل:</p><ul>"
+             "<li><b>VLESS</b> (روی همین سرور و روی نودها): آی‌پی‌های آنلاین هر کاربر از Xray خوانده می‌شود و آی‌پی اضافه فقط برای همان کاربر بلاک می‌شود (اتصال‌های جدید رد می‌شوند). روی نودها تأخیر تشخیص تا ~15 ثانیه است.</li>"
+             "<li><b>WireGuard / AmneziaWG</b>: وقتی یک کلید از دو آی‌پی استفاده شود، آی‌پی endpoint مدام بین دو مقدار جابه‌جا می‌شود؛ پنل این الگو را تشخیص می‌دهد و آی‌پی تازه‌وارد را با iptables روی پورت UDP همان اینباند حدود 60 ثانیه بلاک می‌کند (اگر آی‌پی با کلاینت دیگری مشترک باشد، مثلاً پشت یک NAT، بلاک نمی‌شود). جابه‌جایی ساده‌ی شبکه (وای‌فای ↔ دیتا) بلاک نمی‌شود.</li>"
+             "<li><b>L2TP</b>: اگر نشست‌های PPP هم‌نام بیشتر از max_users شود، جدیدترین نشست‌ها قطع می‌شوند.</li>"
+             "<li><b>OpenVPN</b>: هر حساب یک گواهی دارد و سرور برای هر حساب فقط یک نشست نگه می‌دارد (نشست جدید جای قبلی را می‌گیرد)؛ مقدار بزرگ‌تر از 1 پشتیبانی نمی‌شود.</li></ul>"
+             "<p>ساخت و تغییر: <code>max_users</code> در <code>POST /api/v1/clients</code> و <code>POST /api/v1/clients/{id}/renew</code>؛ مقدار فعلی در پاسخ کلاینت‌ها هست.</p>")
     H.append("<h3>الگوی فروش خودکار (پیشنهادی)</h3><ol>"
              "<li>مشتری در ربات/سایت پلن را انتخاب می‌کند و به درگاه پرداخت می‌رود؛ برای هر سفارش یک شناسه‌ی یکتا (<code>order_id</code>) در دیتابیس خودتان بسازید.</li>"
              "<li>در callback درگاه، پرداخت را حتماً با verify خود درگاه تأیید کنید (به پارامترهای callback اعتماد نکنید).</li>"
@@ -4950,10 +5328,10 @@ def call(method, path, **kw):
     return data
 
 
-def create_client(name, gb, days, order_id, note=""):
+def create_client(name, gb, days, order_id, note="", max_users=0):
     d = call("POST", "/clients", json={
         "name": name, "limit_gb": gb, "days": days, "inbounds": INBOUNDS,
-        "external_id": str(order_id), "note": note})
+        "external_id": str(order_id), "note": note, "max_users": max_users})   # max_users: 0 = نامحدود
     return d["clients"][0]
 
 
@@ -5511,10 +5889,26 @@ def sub(token):
                                          uri=(None if is_awg(ib) or is_l2tp(ib) or is_ovpn(ib) else build_uri(c, ci, ib)),
                                          l2tp=(l2tp_info(c, ci, ib) if is_l2tp(ib) else None), conf=build_conf(c, ci, ib))
                                     for ci, ib in items], ensure_ascii=False), mimetype="application/json", headers=hdr)
-    uris = "\n".join(build_uri(c, ci, ib) for ci, ib in items if not is_awg(ib) and not is_l2tp(ib) and not is_ovpn(ib))
+    uris = "\n".join(build_uri(c, ci, ib) for ci, ib in items
+                     if not is_awg(ib) and not is_l2tp(ib) and not is_ovpn(ib) and not is_custom_sub(ib))
     if fmt == "raw":
         return Response(uris, mimetype="text/plain; charset=utf-8", headers=hdr)
     return Response(base64.b64encode(uris.encode()).decode(), mimetype="text/plain; charset=utf-8", headers=hdr)
+
+
+@app.get("/sub/<token>/custom")
+def sub_custom(token):
+    """ساب کاستوم: آرایهٔ JSON از کانفیگ‌های کامل Xray برای اینباندهایی که «ساب کاستوم» روشن دارند"""
+    c, items = sub_data(token)
+    if client_state(c) != "active":
+        return Response("subscription inactive", status=403, mimetype="text/plain")
+    cfgs = [vless_client_config(c, ci, ib) for ci, ib in items if is_custom_sub(ib) and ci["vuuid"]]
+    title = setting("sub_title", "WireGuard")
+    hdr = {"Subscription-Userinfo": f"upload={c['up_bytes']}; download={c['down_bytes']}; total={c['limit_bytes']}; expire={c['expiry']}",
+           "Profile-Update-Interval": setting("update_interval", "12"),
+           "Profile-Title": "base64:" + base64.b64encode(f"{title} - {c['name']}".encode()).decode(),
+           "Cache-Control": "no-store"}
+    return Response(json.dumps(cfgs, ensure_ascii=False, indent=2), mimetype="application/json", headers=hdr)
 
 
 def sub_one(token, iid):
@@ -5651,6 +6045,10 @@ pre.cf{direction:ltr;text-align:left;background:#0a1322;border:1px solid var(--l
 .mfoot{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
 .tabs{display:flex;gap:4px;overflow-x:auto;border-bottom:1px solid var(--line);margin-bottom:14px;position:sticky;top:0;background:var(--card);padding-top:4px;z-index:2;scrollbar-width:thin}
 .tb{background:none;border:0;border-bottom:2px solid transparent;color:var(--mut);padding:9px 14px;font:inherit;font-size:13.5px;cursor:pointer;white-space:nowrap}
+.swl{display:flex!important;align-items:center;gap:12px;font-size:14px;color:var(--ink)!important}
+input.sw{appearance:none;-webkit-appearance:none;flex:none;width:46px;height:26px;border-radius:13px;background:#3a4560;position:relative;cursor:pointer;transition:.2s;border:0}
+input.sw::after{content:'';position:absolute;top:3px;inset-inline-start:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:.2s}
+input.sw:checked{background:#4f7cff}input.sw:checked::after{inset-inline-start:23px}
 .tb.on{color:#60a5fa;border-bottom-color:#60a5fa}.tp[hidden]{display:none}
 .scan .srow{margin:8px 0}.scan .mut{color:var(--mut);font-size:12.5px;margin:6px 0}.scan h4{margin-top:4px}
 .sr{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
@@ -5885,7 +6283,7 @@ function nodProg(m,job){const box=m.querySelector('#ndF');m.querySelector('#nd_s
   if(d.state=='run')setTimeout(loop,1500);else load()};loop()}
 /* ---------- اینباندها ---------- */
 function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
- (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
+ (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.proto==='vless'&&i.xcfg&&i.xcfg.custom_sub?' <span class="tag">ساب کاستوم</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
  <span class="b ${i.enabled?(i.up?'ok':'warn'):''}">${i.enabled?(i.up?'بالا':'پایین (خطا؟)'):'غیرفعال'}</span></div>
  <div class="meta"><span>پورت: <b>${i.proto==='l2tp'?'500, 4500/udp':i.proto==='ovpn'?i.port+'/'+esc(i.ovpn.transport):i.proto==='vless'?i.port+'/'+i.net:i.port+'/udp'}</b></span>${i.proto==='vless'?'':`<span>IPv4: <b>${esc(i.address4)}</b></span>`}${i.address6?`<span>IPv6: <b>${esc(i.address6)}</b></span>`:''}
  <span>Endpoint: <b>${esc(i.endpoint||'(آدرس پنل)')}${i.endpoint_port?':'+i.endpoint_port:''}</b></span><span>DNS: <b>${esc(i.dns||'—')}</b></span>
@@ -5959,6 +6357,7 @@ const INB=[{s:'اصلی',tab:'پایه'},
  {k:'x_flow',l:'Flow',t:'select',p:'vless',w:'x_transport=tcp,x_security=tls|reality',opts:[['xtls-rprx-vision','xtls-rprx-vision (پیشنهادی)'],['','بدون flow']]},
  {k:'x_fp',l:'Fingerprint کلاینت (uTLS)',t:'select',p:'vless',w:'x_security=tls|reality',opts:XFP.map(a=>[a,a||'بدون'])},
  {k:'x_packet_encoding',l:'Packet Encoding',t:'select',p:'vless',opts:[['','پیش‌فرض'],['xudp','xudp (پیشنهادی برای UDP/بازی)'],['packet','packet']]},
+ {k:'x_custom_sub',l:'می‌خوای کانفیگ‌های این اینباند توی «ساب کاستوم» باشه؟ (کانفیگ کامل JSON مثل v2rayNG، به‌جای لینک vless://)',t:'check',sw:1,p:'vless',h:'روشن: این اینباند از ساب معمولی خارج می‌شود و کانفیگ‌هایش (JSON کامل Xray با پراکسی محلی 10808/10809) در لینک جداگانهٔ «ساب کاستوم» هر کلاینت می‌آید (آدرس: ساب/custom). خاموش: مثل قبل با لینک vless:// در ساب معمولی.'},
  {s:'Reality',tab:'Reality',p:'vless',w:'x_security=reality'},
  {k:'x_reality_dest',l:'Dest (سایت مقصد برای Reality)',p:'vless',w:'x_security=reality',ph:'www.microsoft.com:443',h:'سایتی که TLS 1.3 و h2 داشته باشد و در کشور شما فیلتر نباشد.'},
  {t:'btn',l:'تست Dest (TLS1.3 / h2)',on:'testDest()',p:'vless',w:'x_security=reality'},
@@ -6010,7 +6409,7 @@ function fieldHTML(f,v,edit){const h=fieldInner(f,v,edit);return (f.p||f.w)&&h?`
 function fieldInner(f,v,edit){
  if(f.s)return `<h4>${f.s}</h4>`;if(f.edit&&!edit)return '';if(f.t==='html')return f.html;if(f.t==='btn')return `<div class="fg"><button type="button" class="s" onclick="${f.on}">${f.l}</button></div>`;
  let val=v[f.k];if(val==null)val='';const id='f_'+f.k;const h=f.h?`<small>${f.h}</small>`:'';
- if(f.t==='check')return `<div class="fg"><label class="chk"><input type="checkbox" id="${id}" ${val?'checked':''}> ${f.l}</label>${h}</div>`;
+ if(f.t==='check')return `<div class="fg"><label class="chk${f.sw?' swl':''}"><input type="checkbox" ${f.sw?'class="sw"':''} id="${id}" ${val?'checked':''}> ${f.l}</label>${h}</div>`;
  if(f.t==='select')return `<div class="fg"><label>${f.l}</label><select id="${id}" ${f.lock&&edit?'disabled':''}>${(typeof f.opts==='function'?f.opts():f.opts).map(([a,b])=>`<option value="${a}" ${String(val)===a?'selected':''}>${b}</option>`).join('')}</select>${h}</div>`;
  if(f.t==='textarea')return `<div class="fg"><label>${f.l}</label><textarea id="${id}" spellcheck="false">${esc(val)}</textarea>${h}</div>`;
  return `<div class="fg"><label>${f.l}</label><input id="${id}" type="${f.t==='number'?'number':f.t||'text'}" value="${esc(val)}" placeholder="${esc(f.ph||'')}" ${f.rtl?'style="direction:rtl;text-align:right"':''}>${h}</div>`}
@@ -6076,12 +6475,13 @@ function cliHTML(){return (isA()?meCard():'')+`<div class="bar2" id="ctool"><div
  <button class="p" onclick="newCli()">+ کلاینت جدید</button></div><div id="clist">${cliList()}</div>`}
 const CLI=[{k:'name',l:'نام کلاینت',rtl:1},{k:'count',l:'تعداد (ساخت گروهی؛ نام‌ها شماره‌دار می‌شوند)',t:'number',create:1},
  {k:'note',l:'یادداشت',rtl:1},{k:'limit_gb',l:'محدودیت حجم (گیگابایت)',t:'number',h:'۰ = نامحدود'},
+ {k:'max_users',l:'تعداد کاربر همزمان',t:'number',h:'۰ = نامحدود. مثلاً ۱ یعنی فقط یک نفر (یک آی‌پی) هم‌زمان می‌تواند وصل باشد و نفر دوم بلاک می‌شود. روی VLESS (سرور و نودها)، وایرگارد/AmneziaWG و L2TP اعمال می‌شود؛ OpenVPN خودش برای هر حساب فقط یک نشست نگه می‌دارد.'},
  {k:'reset_period',l:'ریست خودکار ترافیک',t:'select',opts:[['','هرگز'],['daily','روزانه'],['weekly','هفتگی'],['monthly','ماهانه (هر ۳۰ روز)']]}];
 function linkBlock(ib,L){const v=L||{};const f=(k,l,ph)=>`<div class="fg"><label>${l}</label><input class="l_${k}" value="${esc(v[k]??'')}" placeholder="${ph||''}"></div>`;
  return `<div class="lk" data-ib="${ib.id}"><label class="chk"><input type="checkbox" class="lkc" ${L?'checked':''}> <b>${esc(ib.name)}</b> <span class="mut">${esc(ib.remark)}${ib.proto==='vless'?'':' · '+esc(ib.address4)}</span>${ib.proto==='l2tp'?' <span class="tag">L2TP</span>':''}${ib.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${ib.proto==='vless'?' <span class="tag">VLESS</span>':''}${ib.node_id?` <span class="tag">${esc(nodName(ib.node_id))}</span>`:''}</label>
  <details ${isA()||ib.proto!=='wg'?'hidden':''}><summary>تنظیمات ویژه این کلاینت در این اینباند</summary><div class="g2">${f('ip4','IPv4 ثابت','خودکار')}${f('allowed_ips','AllowedIPs کلاینت','پیش‌فرض اینباند')}
  ${f('keepalive','Keepalive','پیش‌فرض اینباند (۰=خاموش)')}${f('dns','DNS','پیش‌فرض اینباند')}${f('mtu','MTU','پیش‌فرض اینباند')}${f('extra_allowed','AllowedIPs اضافه سمت سرور','مثلا 192.168.50.0/24')}</div></details></div>`}
-function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_bytes/1024**3).toFixed(3):0}:{limit_gb:0,count:1};
+function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_bytes/1024**3).toFixed(3):0}:{limit_gb:0,max_users:0,count:1};
  const fields=CLI.filter(f=>!f.create||!c);
  const m=modal(`<h2>${title}</h2>${fields.map(f=>fieldHTML(f,vals,!!c)).join('')}
  <div class="fg"><label>تاریخ انقضا</label><input type="date" id="f_exp" value="${c&&c.expiry?new Date(c.expiry*1000).toISOString().slice(0,10):''}">
@@ -6100,6 +6500,7 @@ function editCli(id){cliModal('ویرایش کلاینت',S.clients.find(x=>x.id
 function delCli(id,n){if(confirm(`کلاینت ${n} حذف شود؟`))act(()=>api('/clients/'+id,'DELETE'),'حذف شد')}
 function subModal(id){const c=S.clients.find(x=>x.id==id);const u=c.sub_url;
  const m=modal(`<h2>اشتراک ${esc(c.name)}</h2><div class="fg"><label>لینک ساب (Hiddify / v2rayN / NekoBox / sing-box)</label><input readonly value="${esc(u)}" onclick="this.select()"></div>
+ ${c.custom_sub_url?`<div class="fg"><label>ساب کاستوم (کانفیگ کامل JSON — v2rayNG)</label><input readonly value="${esc(c.custom_sub_url)}" onclick="this.select()"><button class="s" style="margin-top:6px" onclick="copy('${esc(c.custom_sub_url)}')">کپی لینک ساب کاستوم</button></div>`:''}
  ${S.server.qr?`<img class="qr" src="/sub/${c.token}/link.svg" alt="QR">`:'<div class="mut">برای QR دستور pip install qrcode را اجرا کنید.</div>'}
  <div class="acts"><button class="s" id="b1">کپی لینک</button><button class="s" onclick="window.open('${esc(u)}?format=html')">صفحه اشتراک</button>
  <button class="s" onclick="window.open('${esc(u)}?format=conf')">همه کانفیگ‌ها (.conf)</button><button class="s" onclick="window.open('${esc(u)}?format=raw')">لینک‌های wireguard://</button></div>
@@ -6352,6 +6753,7 @@ def main():
     app.config["SESSION_COOKIE_SECURE"] = bool(tls)
     threading.Thread(target=reconcile, daemon=True).start()
     threading.Thread(target=stats_loop, daemon=True).start()
+    threading.Thread(target=limit_loop, daemon=True).start()
     threading.Thread(target=sys_loop, daemon=True).start()
     threading.Thread(target=node_loop, daemon=True).start()
     threading.Thread(target=update_loop, daemon=True).start()
