@@ -4,7 +4,7 @@
 # آپدیت:  همان دستور بالا را دوباره اجرا کنید (دیتابیس و رمز حفظ می‌شود)
 # حذف:    sepipanel uninstall   (یا: bash <(curl -fsSL .../install.sh) uninstall)
 # منو:    sepipanel
-# متغیرها: PORT=8080  AWG=1 (نصب AmneziaWG)  XRAY=1 (نصب Xray-core برای VLESS؛ وگرنه موقع ساخت اینباند VLESS خودکار دانلود می‌شود)  OVPN=1 (نصب OpenVPN؛ وگرنه موقع ساخت اینباند خودکار نصب می‌شود)  L2TP=1 (نصب xl2tpd+strongSwan؛ وگرنه موقع ساخت اینباند L2TP خودکار نصب می‌شود)  BRANCH=main
+# متغیرها: PORT=8080  AWG=1 (نصب AmneziaWG)  XRAY=1 (نصب Xray-core برای VLESS / Shadowsocks / Trojan؛ وگرنه موقع ساخت اینباند خودکار دانلود می‌شود)  OVPN=1 (نصب OpenVPN؛ وگرنه موقع ساخت اینباند خودکار نصب می‌شود)  L2TP=1 (نصب xl2tpd+strongSwan؛ وگرنه موقع ساخت اینباند L2TP خودکار نصب می‌شود)  BRANCH=main
 set -euo pipefail
 
 # ====== اینجا را با ریپوی خودتان عوض کنید ======
@@ -60,7 +60,7 @@ fi
 
 if [ "${XRAY:-0}" = "1" ] && [ ! -x /usr/local/bin/xray ]; then
   echo ">> نصب Xray-core..."
-  python3 - <<'PYX' || echo "نصب Xray ناموفق بود؛ هنگام ساخت اینباند VLESS دوباره تلاش می‌شود"
+  python3 - <<'PYX' || echo "نصب Xray ناموفق بود؛ هنگام ساخت اینباند Xray (VLESS/Shadowsocks/Trojan) دوباره تلاش می‌شود"
 import platform, urllib.request, zipfile, tempfile, os, shutil
 a = {"x86_64": "64", "amd64": "64", "aarch64": "arm64-v8a", "arm64": "arm64-v8a", "armv7l": "arm32-v7a"}[platform.machine().lower()]
 d = tempfile.mkdtemp(); z = d + "/x.zip"
@@ -143,7 +143,7 @@ if systemctl is-active --quiet sepipanel; then
   echo " (تغییر پورت/دامنه/SSL/رمز/مسیر مخفی، بکاپ، آپدیت و ...)"
   echo " لاگ:   journalctl -u sepipanel -f"
   echo " نکته: پورت‌های UDP اینباندهای وایرگارد را هم در فایروال/پنل هاستینگ باز کنید."
-  echo "       برای اینباند L2TP پورت‌های UDP ‏500 و 4500 و برای OpenVPN و VLESS پورت اینباند را باز کنید (یا گزینهٔ فایروال خودکار را فعال کنید)."
+  echo "       برای اینباند L2TP پورت‌های UDP ‏500 و 4500 و برای OpenVPN و اینباندهای Xray (VLESS/Shadowsocks/Trojan) پورت اینباند را باز کنید (یا گزینهٔ فایروال خودکار را فعال کنید)."
 else
   echo "سرویس بالا نیامد؛ لاگ: journalctl -u sepipanel -e"
   exit 1

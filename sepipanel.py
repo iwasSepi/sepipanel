@@ -274,8 +274,23 @@ def is_l2tp(ib):
 
 
 def is_vless(ib):
+    """اینباندهای مبتنی بر Xray (VLESS و Shadowsocks و Trojan) — همه‌ی منطق اجرا/آمار/نود مشترک است"""
     try:
-        return ib["proto"] == "vless"
+        return ib["proto"] in ("vless", "ss", "trojan")
+    except (KeyError, IndexError):
+        return False
+
+
+def is_ss(ib):
+    try:
+        return ib["proto"] == "ss"
+    except (KeyError, IndexError):
+        return False
+
+
+def is_trojan(ib):
+    try:
+        return ib["proto"] == "trojan"
     except (KeyError, IndexError):
         return False
 
@@ -644,7 +659,7 @@ def _ib_node(d, cur=None):
 
 def parse_inbound(d, cur=None):
     proto = cur["proto"] if cur else str(d.get("proto") or "wg")
-    nid = _ib_node(d, cur) if proto == "vless" else 0        # نود فقط برای VLESS (Xray) معنی دارد
+    nid = _ib_node(d, cur) if proto in ("vless", "ss", "trojan") else 0        # نود فقط برای VLESS/Shadowsocks/Trojan (Xray) معنی دارد
     o = _parse_inbound_core(d, cur)
     o["node_id"] = nid
     return o
@@ -652,10 +667,14 @@ def parse_inbound(d, cur=None):
 
 def _parse_inbound_core(d, cur=None):
     proto = cur["proto"] if cur else str(d.get("proto") or "wg")
-    if proto not in ("wg", "l2tp", "ovpn", "vless"):
+    if proto not in ("wg", "l2tp", "ovpn", "vless", "ss", "trojan"):
         raise Err("پروتکل نامعتبر است")
     if proto == "vless":
         return parse_vless(d, cur)
+    if proto == "trojan":
+        return parse_vless(d, cur, "trojan")
+    if proto == "ss":
+        return parse_ss(d, cur)
     if proto == "l2tp":
         return parse_l2tp(d, cur)
     if proto == "ovpn":
@@ -893,6 +912,31 @@ def build_conf(c, ci, ib):
     return "\n".join(L) + "\n"
 
 
+SUB_REMARK_DEFAULT = "{status} {inbound} | {left} | {days}"
+STATE_FA = {"active": "فعال", "expired": "منقضی", "limit": "حجم تمام", "disabled": "غیرفعال", "admin": "غیرفعال", "key": "غیرفعال"}
+
+
+def link_remark(c, ci, ib):
+    """نام داینامیک هر کانفیگ در اپ کلاینت (مثلاً «🟢 آلمان | 12.3 GB | 20 روز»)؛ قالبش از تنظیمات است. قالب خالی = نام ساده"""
+    plain = f"{c['name']}-{ib['name']}"
+    tpl = setting("sub_remark", SUB_REMARK_DEFAULT)
+    if not tpl:
+        return plain
+    st = client_state(c)
+    lim = c["limit_bytes"] or 0
+    used = (c["up_bytes"] or 0) + (c["down_bytes"] or 0)
+    exp = c["expiry"] or 0
+    d = -(-(exp - now()) // 86400) if exp else None        # روزِ باقی‌مانده (رو به بالا)
+    left_b = max(0, lim - used) if lim else None
+    low = (lim and left_b <= lim * 0.1) or (d is not None and 0 < d <= 3)
+    vals = dict(status="🔴" if st != "active" else "🟡" if low else "🟢", state=STATE_FA.get(st, st),
+                name=c["name"], inbound=ib["name"], remark=ib["remark"] or ib["name"],
+                left="∞" if left_b is None else fmt_b(left_b), used=fmt_b(used), limit="∞" if not lim else fmt_b(lim),
+                days="∞" if d is None else (f"{d} روز" if d > 0 else "منقضی"))
+    out = oneline(re.sub(r"\{(\w+)\}", lambda m: str(vals.get(m.group(1), m.group(0))), tpl))[:120]
+    return out or plain
+
+
 def build_uri(c, ci, ib):
     if is_vless(ib):
         return vless_link(c, ci, ib)
@@ -908,7 +952,7 @@ def build_uri(c, ci, ib):
     if ka:
         P.append(("keepalive", str(ka)))
     return (f"wireguard://{quote(c['private_key'], safe='')}@{host}:{ib['endpoint_port'] or ib['port']}?"
-            + "&".join(f"{k}={v}" for k, v in P) + "#" + quote(f"{c['name']}-{ib['name']}"))
+            + "&".join(f"{k}={v}" for k, v in P) + "#" + quote(link_remark(c, ci, ib)))
 
 
 # ------------------------------ VLESS (Xray-core) ------------------------------
@@ -922,7 +966,8 @@ XRAY_DEFAULT = dict(listen="0.0.0.0", transport="tcp", security="reality", flow=
                     min_ver="1.2", reject_sni=0, allow_insecure=0, path="/", host="", service_name="", authority="",
                     multi_mode=0, xhttp_mode="auto", tcp_header="none", kcp_header="none", kcp_seed="",
                     fallback_dest="", fallback_xver=0, sniffing=1, route_only=0, block_bt=0, block_private=0,
-                    domain_strategy="AsIs", tfo=0, extra_stream="", custom_sub=0)
+                    domain_strategy="AsIs", tfo=0, extra_stream="", custom_sub=0,
+                    ss_method="2022-blake3-aes-128-gcm", ss_network="tcp,udp")
 PRIVATE_CIDRS = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
                  "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10"]
 
@@ -1080,6 +1125,22 @@ def xray_net(ib):
     return "udp" if xcfg_of(ib)["transport"] == "kcp" else "tcp"
 
 
+def xray_nets(ib):
+    """پروتکل‌های لایه ۴ که اینباند روی پورتش گوش می‌دهد (Shadowsocks می‌تواند tcp و udp با هم باشد)"""
+    if is_ss(ib):
+        n = [x_ for x_ in str(xcfg_of(ib).get("ss_network") or "tcp,udp").split(",") if x_ in ("tcp", "udp")]
+        return n or ["tcp", "udp"]
+    return [xray_net(ib)]
+
+
+def ib_nets(r):
+    if r["proto"] in ("wg", "l2tp"):
+        return {"udp"}
+    if r["proto"] == "ovpn":
+        return {ovpn_of(r)["transport"]}
+    return set(xray_nets(r))
+
+
 def xray_email(cid, iid):
     return f"{cid}-{iid}@sp"
 
@@ -1104,7 +1165,8 @@ def _is_ip(h):
         return False
 
 
-def parse_vless(d, cur=None):
+def parse_vless(d, cur=None, proto="vless"):
+    """VLESS و Trojan (هر دو روی Xray با streamSettings یکسان)؛ تفاوت: Trojan فقط password دارد، flow و packetEncoding ندارد"""
     cid = cur["id"] if cur else 0
     nid = _ib_node(d, cur)
     name = str(d.get("name", "")).strip()
@@ -1116,6 +1178,8 @@ def parse_vless(d, cur=None):
     if not port:
         raise Err("پورت لازم است")
     xv = d.get("xcfg") or {}
+    if proto == "trojan" and not cur and "security" not in xv:
+        xv = {**xv, "security": "tls"}          # پیش‌فرض Trojan: TLS
     old = xcfg_of(cur) if cur else dict(XRAY_DEFAULT)
     g = lambda k: xv.get(k, old.get(k, XRAY_DEFAULT[k]))
     strv = lambda k: str(g(k) if g(k) is not None else "").strip()
@@ -1138,8 +1202,7 @@ def parse_vless(d, cur=None):
     if net == "tcp" and port == pp and not nid:
         raise Err("این پورت را خود پنل استفاده می‌کند")
     for r in q("SELECT * FROM inbounds WHERE id!=? AND port=? AND COALESCE(node_id,0)=?", (cid, port, nid)):
-        rnet = "udp" if r["proto"] in ("wg", "l2tp") else (ovpn_of(r)["transport"] if r["proto"] == "ovpn" else xray_net(r))
-        if rnet == net:
+        if net in ib_nets(r):
             raise Err(f"پورت {port}/{net} برای اینباند «{r['name']}» استفاده شده")
     if not nid and net == "udp" and port in (500, 4500, 1701) and q("SELECT 1 FROM inbounds WHERE proto='l2tp'", (), True):
         raise Err("پورت‌های 500، 4500 و 1701 برای L2TP رزرو است")
@@ -1157,6 +1220,8 @@ def parse_vless(d, cur=None):
     o["packet_encoding"] = strv("packet_encoding")
     if o["packet_encoding"] not in ("", "xudp", "packet"):
         raise Err("packetEncoding نامعتبر است")
+    if proto == "trojan":
+        o["flow"], o["packet_encoding"] = "", ""      # Trojan نه flow دارد نه packetEncoding
     o["fp"] = strv("fp")
     if o["fp"] not in XRAY_FP:
         raise Err("fingerprint نامعتبر است")
@@ -1264,7 +1329,86 @@ def parse_vless(d, cur=None):
     ep = str(d.get("endpoint", "") or "").strip()
     if ep and not re.fullmatch(r"[A-Za-z0-9.\-:\[\]_]+", ep):
         raise Err("آدرس Endpoint نامعتبر است")
-    return dict(proto="vless", psk="", obf="", ovpn="", pki=json.dumps(pki), xcfg=json.dumps(o, ensure_ascii=False),
+    return dict(proto=proto, psk="", obf="", ovpn="", pki=json.dumps(pki), xcfg=json.dumps(o, ensure_ascii=False),
+                exclude_sub=1 if d.get("exclude_sub") else 0, name=name, remark=oneline(d.get("remark"))[:100],
+                port=port, private_key="", public_key="", address4="0.0.0.0/32", address6="", endpoint=ep,
+                endpoint_port=num(d.get("endpoint_port"), 0, 0, 65535, "پورت Endpoint"), dns="", mtu=0, table_="", fwmark="",
+                pre_up="", post_up="", pre_down="", post_down="", auto_rules=1 if d.get("auto_rules") else 0, nat_iface="",
+                use_psk=0, client_allowed_ips="0.0.0.0/0, ::/0", client_keepalive=0, client_mtu=0)
+
+
+SS_METHODS = {"2022-blake3-aes-128-gcm": 16, "2022-blake3-aes-256-gcm": 32, "aes-128-gcm": 0, "aes-256-gcm": 0,
+              "chacha20-ietf-poly1305": 0, "xchacha20-ietf-poly1305": 0}      # مقدار = طول کلید 2022 (۰ = AEAD قدیمی)
+
+
+def ss_rand_key(method):
+    n = SS_METHODS.get(method, 0)
+    return base64.b64encode(secrets.token_bytes(n)).decode() if n else secrets.token_urlsafe(16)
+
+
+def parse_ss(d, cur=None):
+    cid = cur["id"] if cur else 0
+    nid = _ib_node(d, cur)
+    name = str(d.get("name", "")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_=+.\-]{1,15}", name):
+        raise Err("نام اینباند باید ۱ تا ۱۵ حرف انگلیسی/عدد/_ - . باشد")
+    if q("SELECT 1 FROM inbounds WHERE name=? AND id!=?", (name, cid), True):
+        raise Err("این نام قبلاً استفاده شده")
+    port = num(d.get("port"), 0, 1, 65535, "پورت")
+    if not port:
+        raise Err("پورت لازم است")
+    xv = d.get("xcfg") or {}
+    old = xcfg_of(cur) if cur else dict(XRAY_DEFAULT)
+    g = lambda k: xv.get(k, old.get(k, XRAY_DEFAULT[k]))
+    strv = lambda k: str(g(k) if g(k) is not None else "").strip()
+    flag = lambda k: 1 if g(k) in (True, 1, "1", "true", "on") else 0
+    o = dict(XRAY_DEFAULT)
+    o["transport"], o["security"], o["flow"] = "tcp", "none", ""
+    o["ss_method"] = strv("ss_method") or "2022-blake3-aes-128-gcm"
+    if o["ss_method"] not in SS_METHODS:
+        raise Err("متد رمزنگاری Shadowsocks نامعتبر است")
+    o["ss_network"] = strv("ss_network") or "tcp,udp"
+    if o["ss_network"] not in ("tcp,udp", "tcp", "udp"):
+        raise Err("شبکه Shadowsocks باید tcp,udp یا tcp یا udp باشد")
+    if cur and o["ss_method"] != old.get("ss_method") and q("SELECT 1 FROM client_inbound WHERE inbound_id=?", (cid,), True):
+        raise Err("تا وقتی کلاینت دارد، متد رمزنگاری قابل تغییر نیست (کلید هر کلاینت به متد وابسته است)")
+    pp = num(setting("panel_port"), PANEL_PORT, 1, 65535, "پورت پنل")
+    nets = o["ss_network"].split(",")
+    if "tcp" in nets and port == pp and not nid:
+        raise Err("این پورت را خود پنل استفاده می‌کند")
+    for r in q("SELECT * FROM inbounds WHERE id!=? AND port=? AND COALESCE(node_id,0)=?", (cid, port, nid)):
+        for net in nets:
+            if net in ib_nets(r):
+                raise Err(f"پورت {port}/{net} برای اینباند «{r['name']}» استفاده شده")
+    if not nid and "udp" in nets and port in (500, 4500, 1701) and q("SELECT 1 FROM inbounds WHERE proto='l2tp'", (), True):
+        raise Err("پورت‌های 500، 4500 و 1701 برای L2TP رزرو است")
+    lst = strv("listen") or "0.0.0.0"
+    try:
+        ipaddress.ip_address(lst)
+    except ValueError:
+        raise Err("آدرس listen باید IP معتبر باشد (0.0.0.0 یا ::)")
+    o["listen"] = lst
+    o["sniffing"], o["route_only"] = flag("sniffing"), flag("route_only")
+    o["block_bt"], o["block_private"], o["tfo"] = flag("block_bt"), flag("block_private"), flag("tfo")
+    o["custom_sub"] = flag("custom_sub")
+    o["domain_strategy"] = strv("domain_strategy") or "AsIs"
+    if o["domain_strategy"] not in ("AsIs", "UseIP", "UseIPv4", "UseIPv6"):
+        raise Err("domainStrategy نامعتبر است")
+    pki = pki_of(cur) if cur else {}
+    n_key = SS_METHODS[o["ss_method"]]
+    if n_key:           # Shadowsocks 2022: کلید سرور (هر کلاینت کلید خودش را دارد)
+        try:
+            ok_key = len(base64.b64decode(pki.get("ss_key", ""))) == n_key
+        except Exception:
+            ok_key = False
+        if d.get("regen_keys") or not ok_key:
+            pki["ss_key"] = ss_rand_key(o["ss_method"])
+    else:
+        pki["ss_key"] = ""
+    ep = str(d.get("endpoint", "") or "").strip()
+    if ep and not re.fullmatch(r"[A-Za-z0-9.\-:\[\]_]+", ep):
+        raise Err("آدرس Endpoint نامعتبر است")
+    return dict(proto="ss", psk="", obf="", ovpn="", pki=json.dumps(pki), xcfg=json.dumps(o, ensure_ascii=False),
                 exclude_sub=1 if d.get("exclude_sub") else 0, name=name, remark=oneline(d.get("remark"))[:100],
                 port=port, private_key="", public_key="", address4="0.0.0.0/32", address6="", endpoint=ep,
                 endpoint_port=num(d.get("endpoint_port"), 0, 0, 65535, "پورت Endpoint"), dns="", mtu=0, table_="", fwmark="",
@@ -1287,6 +1431,15 @@ def xray_users(ib):
     for r in q("""SELECT c.*, ci.vuuid, ci.client_id AS cid2 FROM client_inbound ci JOIN clients c ON c.id=ci.client_id
                   WHERE ci.inbound_id=? ORDER BY c.id""", (ib["id"],)):
         if r["vuuid"] and client_state(r) == "active":
+            if is_ss(ib):
+                u = {"password": r["vuuid"], "email": xray_email(r["cid2"], ib["id"])}
+                if not o["ss_method"].startswith("2022-"):
+                    u["method"] = o["ss_method"]
+                out.append(u)
+                continue
+            if is_trojan(ib):
+                out.append({"password": r["vuuid"], "email": xray_email(r["cid2"], ib["id"]), "level": 0})
+                continue
             u = {"id": r["vuuid"], "email": xray_email(r["cid2"], ib["id"]), "level": 0}
             if o["flow"]:
                 u["flow"] = o["flow"]
@@ -1335,11 +1488,18 @@ def xray_build(ib):
         st["sockopt"] = {"tcpFastOpen": True}
     if o["extra_stream"]:
         _deep_merge(st, json.loads(o["extra_stream"]))
-    settings = {"clients": xray_users(ib), "decryption": "none"}
+    settings = {"clients": xray_users(ib)} if is_trojan(ib) else {"clients": xray_users(ib), "decryption": "none"}
     if o["fallback_dest"]:
         fd = o["fallback_dest"]
         settings["fallbacks"] = [{"dest": int(fd) if fd.isdigit() else fd, "xver": o["fallback_xver"]}]
-    inbound = {"tag": tag, "listen": o["listen"], "port": ib["port"], "protocol": "vless", "settings": settings, "streamSettings": st}
+    inbound = {"tag": tag, "listen": o["listen"], "port": ib["port"], "protocol": "trojan" if is_trojan(ib) else "vless", "settings": settings, "streamSettings": st}
+    if is_ss(ib):
+        ssst = {"method": o["ss_method"], "network": o["ss_network"], "clients": settings["clients"]}
+        if o["ss_method"].startswith("2022-"):
+            ssst["password"] = pki.get("ss_key", "")
+        inbound = {"tag": tag, "listen": o["listen"], "port": ib["port"], "protocol": "shadowsocks", "settings": ssst}
+        if o["tfo"]:
+            inbound["streamSettings"] = {"sockopt": {"tcpFastOpen": True}}
     if o["sniffing"]:
         inbound["sniffing"] = {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": bool(o["route_only"])}
     rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
@@ -1357,10 +1517,35 @@ def xray_build(ib):
             "routing": {"domainStrategy": "AsIs", "rules": rules}}
 
 
+XP = ("vless", "shadowsocks", "trojan")
+
+
+def _ukey(u):
+    return (u.get("id") or u.get("password"), u.get("email"))
+
+
+def xray_adu_payload(cfg, users):
+    """JSON برای «xray api adu» (افزودن زندهٔ کاربر بدون ری‌استارت)"""
+    ib_ = cfg["inbounds"][1]
+    if ib_["protocol"] == "shadowsocks":
+        st = {k: v for k, v in ib_["settings"].items() if k != "clients"}
+    elif ib_["protocol"] == "trojan":
+        st = {}
+    else:
+        st = {"decryption": "none"}
+    return {"inbounds": [{"tag": ib_["tag"], "protocol": ib_["protocol"], "port": ib_["port"], "listen": ib_["listen"],
+                          "settings": {**st, "clients": users}}]}
+
+
 def xray_summary(ib):
     cfg = xray_build(ib)
     for i in cfg["inbounds"]:
-        if i.get("protocol") == "vless":
+        if i.get("protocol") == "shadowsocks":
+            if i["settings"].get("password"):
+                i["settings"]["password"] = "********"
+            for u in i["settings"]["clients"]:
+                u["password"] = u["password"][:4] + "-****"
+        if i.get("protocol") in ("vless", "trojan"):
             st = i["streamSettings"]
             if "realitySettings" in st:
                 st["realitySettings"]["privateKey"] = "********"
@@ -1368,7 +1553,10 @@ def xray_summary(ib):
                 if "key" in c_:
                     c_["key"] = ["********"]
             for u in i["settings"]["clients"]:
-                u["id"] = u["id"][:8] + "-****"
+                if "id" in u:
+                    u["id"] = u["id"][:8] + "-****"
+                else:
+                    u["password"] = u["password"][:4] + "-****"
     return json.dumps(cfg, indent=2, ensure_ascii=False)
 
 
@@ -1376,19 +1564,19 @@ def xray_shape(cfg):
     """کانفیگ بدون لیست کاربران؛ برای تشخیص اینکه فقط کاربرها عوض شده‌اند"""
     c = json.loads(json.dumps(cfg))
     for i in c.get("inbounds", []):
-        if i.get("protocol") == "vless":
+        if i.get("protocol") in XP:
             i["settings"]["clients"] = []
     return c
 
 
 def xray_fw(ib, add):
-    net = xray_net(ib)
-    r = ["INPUT", "-p", net, "--dport", str(ib["port"]), "-j", "ACCEPT"]
-    exists = run(["iptables", "-C"] + r, timeout=8)[0] == 0
-    if add and not exists:
-        run(["iptables", "-I"] + r, timeout=8)
-    elif not add and exists:
-        run(["iptables", "-D"] + r, timeout=8)
+    for net in xray_nets(ib):
+        r = ["INPUT", "-p", net, "--dport", str(ib["port"]), "-j", "ACCEPT"]
+        exists = run(["iptables", "-C"] + r, timeout=8)[0] == 0
+        if add and not exists:
+            run(["iptables", "-I"] + r, timeout=8)
+        elif not add and exists:
+            run(["iptables", "-D"] + r, timeout=8)
 
 
 def apply_vless(ib, restart=False):
@@ -1423,16 +1611,14 @@ def apply_vless(ib, restart=False):
     up = xray_up(ib)
     need = restart or not up or old is None or xray_shape(old) != xray_shape(cfg)
     if not need:
-        old_ids = {u["id"] for i in old["inbounds"] if i.get("protocol") == "vless" for u in i["settings"]["clients"]}
+        old_ids = {_ukey(u) for i in old["inbounds"] if i.get("protocol") in XP for u in i["settings"]["clients"]}
         new = [u for u in cfg["inbounds"][1]["settings"]["clients"]]
-        new_ids = {u["id"] for u in new}
+        new_ids = {_ukey(u) for u in new}
         if old_ids - new_ids:
             need = True          # حذف کاربر → ری‌استارت تا اتصال‌های بازِ او قطع شود
         elif new_ids - old_ids:
             tmp = path + ".add"
-            add = {"inbounds": [{"tag": cfg["inbounds"][1]["tag"], "protocol": "vless", "port": ib["port"],
-                                 "listen": cfg["inbounds"][1]["listen"],
-                                 "settings": {"clients": [u for u in new if u["id"] not in old_ids], "decryption": "none"}}]}
+            add = xray_adu_payload(cfg, [u for u in new if _ukey(u) not in old_ids])
             write_file(tmp, json.dumps(add), 0o600, backup=False)
             rc, _, _ = run([xray_bin(), "api", "adu", f"-s=127.0.0.1:{cfg['inbounds'][0]['port']}", tmp], timeout=15)
             try:
@@ -1484,7 +1670,7 @@ def _vless_ingest(ib, out):
 
 
 def collect_vless_stats():
-    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='vless' AND COALESCE(node_id,0)=0"):
+    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto IN ('vless','ss','trojan') AND COALESCE(node_id,0)=0"):
         if not xray_bin() or not xray_up(ib):
             continue
         try:
@@ -1498,13 +1684,29 @@ def collect_vless_stats():
         _vless_ingest(ib, out)
 
 
+def ss_link(c, ci, ib):
+    """ss://  — 2022: method:serverKey:userKey به‌صورت percent-encoded (SIP022)؛ AEAD قدیمی: base64url(method:password) (SIP002)"""
+    o = xcfg_of(ib)
+    m, host = o["ss_method"], ep_host(ib)
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    if m.startswith("2022-"):
+        ui = quote(m, safe="") + ":" + quote(pki_of(ib).get("ss_key", "") + ":" + ci["vuuid"], safe="")
+    else:
+        ui = base64.urlsafe_b64encode(f"{m}:{ci['vuuid']}".encode()).decode().rstrip("=")
+    return f"ss://{ui}@{host}:{ib['endpoint_port'] or ib['port']}#" + quote(link_remark(c, ci, ib))
+
+
 def vless_link(c, ci, ib):
+    if is_ss(ib):
+        return ss_link(c, ci, ib)
     o = xcfg_of(ib)
     t, sec = o["transport"], o["security"]
     host = ep_host(ib)
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
-    P = [("encryption", "none"), ("type", t)]
+    trj = is_trojan(ib)
+    P = ([] if trj else [("encryption", "none")]) + [("type", t)]
     if t == "tcp" and o["tcp_header"] == "http":
         P += [("headerType", "http"), ("path", quote(o["path"] or "/", safe="")), ("host", quote(o["host"], safe=""))]
     elif t in ("ws", "httpupgrade", "xhttp"):
@@ -1541,8 +1743,9 @@ def vless_link(c, ci, ib):
             P.append(("spx", quote(o["spider_x"], safe="")))
     if o["packet_encoding"]:
         P.append(("packetEncoding", o["packet_encoding"]))
-    return (f"vless://{ci['vuuid']}@{host}:{ib['endpoint_port'] or ib['port']}?" + "&".join(f"{k}={v}" for k, v in P)
-            + "#" + quote(f"{c['name']}-{ib['name']}"))
+    scheme, ident = ("trojan", quote(ci["vuuid"], safe="")) if trj else ("vless", ci["vuuid"])
+    return (f"{scheme}://{ident}@{host}:{ib['endpoint_port'] or ib['port']}?" + "&".join(f"{k}={v}" for k, v in P)
+            + "#" + quote(link_remark(c, ci, ib)))
 
 
 def is_custom_sub(ib):
@@ -1586,8 +1789,8 @@ def vless_client_config(c, ci, ib):
                                  "publicKey": o["reality_pub"], "shortId": (_comma(o["short_ids"]) or [""])[0],
                                  "spiderX": o["spider_x"] or "/"}
     sniff = {"enabled": True, "destOverride": ["http", "tls", "quic", "fakedns"], "routeOnly": False}
-    return {
-        "remarks": f"{c['name']}-{ib['name']}",
+    cfg = {
+        "remarks": link_remark(c, ci, ib),
         "log": {"access": "", "error": "", "loglevel": "warning"},
         "inbounds": [
             {"tag": "socks", "port": 10808, "listen": "127.0.0.1", "protocol": "socks", "sniffing": sniff,
@@ -1602,6 +1805,18 @@ def vless_client_config(c, ci, ib):
             {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}}],
         "dns": {"servers": ["1.1.1.1", "8.8.8.8"]},
         "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}]}}
+    if is_ss(ib):
+        m = o["ss_method"]
+        pw = (pki_of(ib).get("ss_key", "") + ":" + ci["vuuid"]) if m.startswith("2022-") else ci["vuuid"]
+        cfg["outbounds"][0] = {"tag": "proxy", "protocol": "shadowsocks",
+                               "settings": {"servers": [{"address": host, "port": int(ib["endpoint_port"] or ib["port"]),
+                                                         "method": m, "password": pw, "level": 0}]}}
+    if is_trojan(ib):
+        cfg["outbounds"][0] = {"tag": "proxy", "protocol": "trojan",
+                               "settings": {"servers": [{"address": host, "port": int(ib["endpoint_port"] or ib["port"]),
+                                                         "password": ci["vuuid"], "level": 0}]},
+                               "streamSettings": ss, "mux": {"enabled": False, "concurrency": -1}}
+    return cfg
 
 
 # ------------------------------ OpenVPN (سرویس openvpn-server@<name>) ------------------------------
@@ -2192,7 +2407,8 @@ def sync_inbound_clients(iid):
         for r in rows:
             if not r["vuuid"]:
                 x("UPDATE client_inbound SET vuuid=?, ip4='', ip6='', psk='' WHERE client_id=? AND inbound_id=?",
-                  (str(uuid.uuid4()), r["client_id"], iid))
+                  (ss_rand_key(xcfg_of(ib)["ss_method"]) if is_ss(ib) else secrets.token_urlsafe(18) if is_trojan(ib) else str(uuid.uuid4()),
+                   r["client_id"], iid))
         return srv4
     if is_ovpn(ib):
         pki, kt = pki_of(ib), ovpn_of(ib)["keytype"]
@@ -2494,7 +2710,7 @@ def _online_from(users, ib, limited, online):
 
 def _enforce_vless(limited, t):
     ibs, online = {}, {}
-    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto='vless'"):
+    for ib in q("SELECT * FROM inbounds WHERE enabled=1 AND proto IN ('vless','ss','trojan')"):
         if ib_node(ib):
             c = NODE_ONLINE.get(ib["id"])
             if not c or t - c[0] > 45 or not xray_up(ib):
@@ -2794,7 +3010,7 @@ def ser_inbound(r, ups):
     d = {k: r[k] for k in r.keys() if k not in ("private_key", "pki")}
     d["ovpn"] = ovpn_of(r) if is_ovpn(r) else {}
     d["xcfg"] = xcfg_of(r) if is_vless(r) else {}
-    d["net"] = xray_net(r) if is_vless(r) else ""
+    d["net"] = "+".join(xray_nets(r)) if is_vless(r) else ""
     d["obf"] = obf_of(r); d["awg"] = is_awg(r); d["obf_enabled"] = 1 if is_awg(r) else 0
     d["up"] = r["name"] in ups
     d["clients"] = q("SELECT COUNT(*) n FROM client_inbound WHERE inbound_id=?", (r["id"],), True)["n"]
@@ -2810,7 +3026,7 @@ def ser_client(c):
     d["sub_url"] = f"{base_url()}/sub/{c['token']}"
     d["custom_sub_url"] = ""
     for l_ in links:
-        if l_["ib_proto"] == "vless" and l_["vuuid"] and is_custom_sub(q("SELECT * FROM inbounds WHERE id=?", (l_["inbound_id"],), True)):
+        if l_["ib_proto"] in ("vless", "ss", "trojan") and l_["vuuid"] and is_custom_sub(q("SELECT * FROM inbounds WHERE id=?", (l_["inbound_id"],), True)):
             d["custom_sub_url"] = f"{base_url()}/sub/{c['token']}/custom"
             break
     d["online"] = any(l["last_hs"] and now() - l["last_hs"] < 180 for l in links)
@@ -2820,7 +3036,7 @@ def ser_client(c):
                        proto=l["ib_proto"] or "wg", l2tp_user=l["l2tp_user"], l2tp_pass=l["l2tp_pass"],
                        vuuid=l["vuuid"]) for l in links]
     for L_ in d["links"]:
-        if L_["proto"] == "vless" and L_["vuuid"]:
+        if L_["proto"] in ("vless", "ss", "trojan") and L_["vuuid"]:
             try:
                 L_["vlink"] = vless_link(c, L_, q("SELECT * FROM inbounds WHERE id=?", (L_["inbound_id"],), True))
             except Exception:
@@ -4024,13 +4240,17 @@ def node_up(ib):
 
 
 def node_fw_script(ib, add):
-    net, port = xray_net(ib), int(ib["port"])
+    port = int(ib["port"])
     ufw = "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'"
-    if add:
-        return (f"command -v iptables >/dev/null 2>&1 && ! iptables -C INPUT -p {net} --dport {port} -j ACCEPT 2>/dev/null "
-                f"&& iptables -I INPUT -p {net} --dport {port} -j ACCEPT; {ufw} && ufw allow {port}/{net} >/dev/null 2>&1; true")
-    return (f"command -v iptables >/dev/null 2>&1 && while iptables -C INPUT -p {net} --dport {port} -j ACCEPT 2>/dev/null; "
-            f"do iptables -D INPUT -p {net} --dport {port} -j ACCEPT; done; {ufw} && ufw delete allow {port}/{net} >/dev/null 2>&1; true")
+    parts = []
+    for net in xray_nets(ib):
+        if add:
+            parts.append(f"command -v iptables >/dev/null 2>&1 && ! iptables -C INPUT -p {net} --dport {port} -j ACCEPT 2>/dev/null "
+                         f"&& iptables -I INPUT -p {net} --dport {port} -j ACCEPT; {ufw} && ufw allow {port}/{net} >/dev/null 2>&1")
+        else:
+            parts.append(f"command -v iptables >/dev/null 2>&1 && while iptables -C INPUT -p {net} --dport {port} -j ACCEPT 2>/dev/null; "
+                         f"do iptables -D INPUT -p {net} --dport {port} -j ACCEPT; done; {ufw} && ufw delete allow {port}/{net} >/dev/null 2>&1")
+    return "; ".join(parts) + "; true"
 
 
 def apply_vless_remote(ib, restart=False):
@@ -4076,14 +4296,12 @@ def apply_vless_remote(ib, restart=False):
             s.run(node_fw_script(ib, True))
         need = restart or not up or old is None or xray_shape(old) != xray_shape(cfg)
         if not need:
-            old_ids = {u["id"] for i in old["inbounds"] if i.get("protocol") == "vless" for u in i["settings"]["clients"]}
-            new_ids = {u["id"] for u in new_users}
+            old_ids = {_ukey(u) for i in old["inbounds"] if i.get("protocol") in XP for u in i["settings"]["clients"]}
+            new_ids = {_ukey(u) for u in new_users}
             if old_ids - new_ids:
                 need = True          # حذف کاربر → ری‌استارت تا اتصال‌های بازِ او قطع شود
             elif new_ids - old_ids:
-                add = {"inbounds": [{"tag": cfg["inbounds"][1]["tag"], "protocol": "vless", "port": ib["port"],
-                                     "listen": cfg["inbounds"][1]["listen"],
-                                     "settings": {"clients": [u for u in new_users if u["id"] not in old_ids], "decryption": "none"}}]}
+                add = xray_adu_payload(cfg, [u for u in new_users if _ukey(u) not in old_ids])
                 s.put(add_path, json.dumps(add), 0o600)
                 rc, _, _ = s.run(f"{qx} api adu -s=127.0.0.1:{aport} {qa}; r=$?; rm -f {qa}; exit $r", timeout=20)
                 need = rc != 0
@@ -4129,7 +4347,7 @@ def vless_teardown_remote(ib):
 def node_probe(n):
     """یک اتصال SSH: نسخه‌ی Xray + وضعیت سرویس هر اینباند + آمار ترافیک؛ نتیجه در NODE_STATE"""
     nid, xb = n["id"], n["xray_bin"] or XRAY_BIN
-    ibs = {r["name"]: r for r in q("SELECT * FROM inbounds WHERE node_id=? AND proto='vless' AND enabled=1", (nid,))}
+    ibs = {r["name"]: r for r in q("SELECT * FROM inbounds WHERE node_id=? AND proto IN ('vless','ss','trojan') AND enabled=1", (nid,))}
     qx = shlex.quote(xb)
     parts = [f"echo '@@V'; {qx} version 2>/dev/null | head -1"]
     for ib in ibs.values():
@@ -4557,7 +4775,7 @@ def up_ifaces():
     for r in q("SELECT * FROM inbounds WHERE proto='ovpn' AND enabled=1"):
         if ovpn_up(r):
             ups.add(r["name"])
-    for r in q("SELECT * FROM inbounds WHERE proto='vless' AND enabled=1"):
+    for r in q("SELECT * FROM inbounds WHERE proto IN ('vless','ss','trojan') AND enabled=1"):
         if xray_up(r):
             ups.add(r["name"])
     return ups
@@ -4571,6 +4789,7 @@ def state_super():
         inbounds=[ser_inbound(r, ups) for r in q("SELECT * FROM inbounds ORDER BY id")],
         clients=[ser_client(c) for c in q("SELECT * FROM clients ORDER BY id DESC")],
         settings=dict(public_url=setting("public_url"), sub_title=setting("sub_title", "WireGuard"), sub_telegram=setting("sub_telegram", ""),
+                      sub_remark=setting("sub_remark", SUB_REMARK_DEFAULT),
                       update_interval=int(setting("update_interval", "12") or 12)),
         role="super", admins=[ser_admin(a) for a in q("SELECT * FROM admins ORDER BY id DESC")],
         nodes=[ser_node(n) for n in q("SELECT * FROM nodes ORDER BY id")],
@@ -5257,7 +5476,7 @@ def api_docs_html(base):
                 resp='{"role": "admin", "key": {"name": "bot", "limit_bytes": 107374182400, "used_bytes": 52428800, "expiry": 1798000000, "state": "active", "clients": 12},\n "account": {"username": "bot", "limit_bytes": 1073741824000, "used_bytes": 52428800, "expiry": 0, "state": "active"}}'))
     H.append(ep("GET", "/api/v1/inbounds", "اینباندهای فعال را می‌دهد تا id هر اینباند را برای ساخت کلاینت بدانید (id را یک‌بار بردارید و در ربات ثابت بگذارید).",
                 ex='curl -H "Authorization: Bearer $KEY" @@B@@/api/v1/inbounds',
-                resp='{"inbounds": [{"id": 1, "name": "wg0", "remark": "", "proto": "wg", "port": 51820, "node_id": 0, "up": true},\n  {"id": 2, "name": "vless-de", "remark": "آلمان", "proto": "vless", "port": 443, "node_id": 1, "up": true}]}'))
+                resp='{"inbounds": [{"id": 1, "name": "wg0", "remark": "", "proto": "wg", "port": 51820, "node_id": 0, "up": true},\n  {"id": 2, "name": "vless-de", "remark": "آلمان", "proto": "vless", "port": 443, "node_id": 1, "up": true},\n  {"id": 3, "name": "trojan-nl", "remark": "هلند", "proto": "trojan", "port": 443, "node_id": 2, "up": true}]}'))
     H.append(ep("POST", "/api/v1/clients", "یک کلاینت (یا چند تا) می‌سازد و همان لحظه کانفیگ را روی اینباندهای انتخاب‌شده اعمال می‌کند. اصلی‌ترین مسیر برای فروش.",
                 params=[("name", "نام کلاینت (الزامی)؛ مثلاً <code>tg12345-1001</code>"),
                         ("inbounds", "لیست id اینباندها (الزامی)؛ مثلاً <code>[1, 2]</code>"),
@@ -5269,7 +5488,7 @@ def api_docs_html(base):
                         ("max_users", "حداکثر کاربر هم‌زمان؛ 0 یا نفرستادن = نامحدود. مثلاً <code>1</code> یعنی فقط یک دستگاه/آی‌پی هم‌زمان (توضیح کامل در بخش «محدودیت کاربر هم‌زمان»)"),
                         ("count", "تعداد کلاینت (پیش‌فرض 1، حداکثر 200)؛ با <code>external_id</code> فقط 1")],
                 ex='curl -X POST @@B@@/api/v1/clients \\\n  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \\\n  -d \'{"name": "tg12345-1001", "limit_gb": 30, "days": 30, "inbounds": [1, 2], "external_id": "1001", "note": "tg:12345"}\'',
-                resp='{"ok": true, "existing": false, "warn": "",\n "clients": [{"id": 12, "name": "tg12345-1001", "state": "active", "enabled": 1,\n   "limit_bytes": 32212254720, "up_bytes": 0, "down_bytes": 0, "expiry": 1795000000,\n   "token": "Ab3xYz...", "sub_url": "@@B@@/sub/Ab3xYz...", "custom_sub_url": "", "ext_id": "1001", "max_users": 1,\n   "links": [{"inbound_id": 2, "ib_name": "vless-de", "proto": "vless", "vlink": "vless://..."}]}]}'))
+                resp='{"ok": true, "existing": false, "warn": "",\n "clients": [{"id": 12, "name": "tg12345-1001", "state": "active", "enabled": 1,\n   "limit_bytes": 32212254720, "up_bytes": 0, "down_bytes": 0, "expiry": 1795000000,\n   "token": "Ab3xYz...", "sub_url": "@@B@@/sub/Ab3xYz...", "custom_sub_url": "", "ext_id": "1001", "max_users": 1,\n   "links": [{"inbound_id": 2, "ib_name": "vless-de", "proto": "vless", "vlink": "vless://..."},\n    {"inbound_id": 3, "ib_name": "trojan-nl", "proto": "trojan", "vlink": "trojan://..."}]}]}'))
     H.append(ep("GET", "/api/v1/clients", "لیست کلاینت‌ها (کلید ادمین فقط کلاینت‌های خودش را می‌بیند). برای نمایش وضعیت و مصرف به مشتری یا پیدا کردن کلاینت از روی سفارش.",
                 params=[("external_id", "پیدا کردن کلاینت یک سفارش"), ("name", "نام دقیق"), ("token", "توکن داخل لینک اشتراک (مشتری لینکش را بفرستد، شما کلاینتش را پیدا کنید)"),
                         ("q", "جستجو در نام و یادداشت (مثلاً آیدی تلگرام)"), ("limit / offset", "صفحه‌بندی؛ پیش‌فرض 50، حداکثر 200")],
@@ -5291,8 +5510,10 @@ def api_docs_html(base):
     H.append(ep("POST", "/api/v1/clients/{id}/reset-token", "لینک اشتراک را عوض می‌کند و لینک قبلی از کار می‌افتد (وقتی مشتری لینکش را لو داده). لینک جدید را با GET همان کلاینت بخوانید."))
     H.append(ep("DELETE", "/api/v1/clients/{id}", "کلاینت را برای همیشه حذف می‌کند.",
                 ex='curl -X DELETE -H "Authorization: Bearer $KEY" @@B@@/api/v1/clients/12'))
-    H.append("<h3>لینک اشتراک (sub_url)</h3><p>همان <code>sub_url</code> را به مشتری بدهید. برنامه‌های کلاینت (V2Ray، Hiddify، Streisand، …) آن را به‌صورت اشتراک می‌خوانند و مرورگر یک صفحه‌ی زیبا با QR و آموزش نشان می‌دهد. پارامترهای اختیاری: <code>?format=raw</code> (لینک‌های خام)، <code>?format=json</code>، <code>?format=conf</code>، <code>?inbound=ID</code> (فقط یک اینباند). فایل تک‌تک: <code>/sub/&lt;token&gt;/&lt;inbound_id&gt;.conf</code> (یا <code>.ovpn</code>) و QR: <code>/sub/&lt;token&gt;/link.svg</code>. وقتی حجم/زمان کلاینت تمام شود لینک اشتراک 403 می‌دهد.</p>")
+    H.append("<h3>لینک اشتراک (sub_url)</h3><p>همان <code>sub_url</code> را به مشتری بدهید. برنامه‌های کلاینت (V2Ray، Hiddify، Streisand، …) آن را به‌صورت اشتراک می‌خوانند و مرورگر یک صفحه‌ی زیبا با QR و آموزش نشان می‌دهد. پارامترهای اختیاری: <code>?format=raw</code> (لینک‌های خام)، <code>?format=json</code>، <code>?format=conf</code>، <code>?inbound=ID</code> (فقط یک اینباند). فایل تک‌تک: <code>/sub/&lt;token&gt;/&lt;inbound_id&gt;.conf</code> (یا <code>.ovpn</code>) و QR: <code>/sub/&lt;token&gt;/link.svg</code>. وقتی حجم/زمان کلاینت تمام شود لینک اشتراک 403 می‌دهد. نام هر کانفیگ داخل اپ کلاینت «داینامیک» است (مثلاً <code>🟢 آلمان | 12.3 GB | 20 روز</code>) و قالبش از «تنظیمات ← تنظیمات اشتراک» عوض می‌شود؛ مقدارها هر بار که اپ اشتراک را آپدیت کند تازه می‌شوند.</p>")
     H.append("<h3>ساب کاستوم (کانفیگ کامل JSON برای VLESS)</h3><p>در تنظیمات هر اینباند VLESS (تب «VLESS») گزینه‌ی «ساب کاستوم» هست. اگر روشن باشد، آن اینباند از ساب معمولی خارج می‌شود و کانفیگ هر کلاینت به‌صورت یک کانفیگ کامل Xray (مثل «Custom config» در v2rayNG؛ با پراکسی محلی socks روی 10808 و http روی 10809) در لینک جداگانه‌ی <code>/sub/&lt;token&gt;/custom</code> می‌آید؛ خروجی یک آرایه‌ی JSON است و هر عضو <code>remarks</code> دارد. این لینک در پاسخ کلاینت‌ها با کلید <code>custom_sub_url</code> برمی‌گردد (اگر کلاینت هیچ اینباند کاستومی نداشته باشد خالی است). هدرهای حجم/زمان (<code>Subscription-Userinfo</code>) مثل ساب معمولی هستند و با اتمام حجم/زمان، پاسخ 403 می‌شود.</p>")
+    H.append("<h3>اینباند Shadowsocks</h3><p>پروتکل <code>ss</code> (Shadowsocks روی Xray) مثل VLESS قابل ساخت است و روی نودها هم کار می‌کند. متدها: <code>2022-blake3-aes-128-gcm</code> (پیشنهادی)، <code>2022-blake3-aes-256-gcm</code> و AEAD قدیمی (<code>aes-128-gcm</code>، <code>aes-256-gcm</code>، <code>chacha20-ietf-poly1305</code>، <code>xchacha20-ietf-poly1305</code>)؛ شبکه TCP، UDP یا هر دو. هر کلاینت کلید/رمز مخصوص خودش را دارد و در <code>links[].vlink</code> به‌صورت لینک <code>ss://</code> (فرمت SIP002 / SIP022) برمی‌گردد؛ مصرف، محدودیت حجم/زمان، <code>max_users</code>، نام داینامیک و ساب کاستوم دقیقاً مثل VLESS کار می‌کنند. در <code>GET /api/v1/inbounds</code> مقدار <code>proto</code> برابر <code>ss</code> است.</p>")
+    H.append("<h3>اینباند Trojan</h3><p>پروتکل <code>trojan</code> (Trojan روی Xray) با همان تنظیمات ترنسپورت و امنیت VLESS ساخته می‌شود: TCP، WebSocket، gRPC، HTTPUpgrade، xHTTP و mKCP با امنیت TLS (پیش‌فرض)، Reality یا بدون امنیت (فقط پشت CDN)، به‌همراه SNI، ALPN، Fingerprint، Fallback، Sniffing و نود. Trojan فیلد flow و packetEncoding ندارد. هر کلاینت یک password تصادفی مخصوص خودش دارد که در <code>links[].vlink</code> به‌صورت لینک <code>trojan://</code> برمی‌گردد؛ مصرف، محدودیت حجم/زمان، <code>max_users</code>، نام داینامیک و ساب کاستوم دقیقاً مثل VLESS کار می‌کنند. در <code>GET /api/v1/inbounds</code> مقدار <code>proto</code> برابر <code>trojan</code> است.</p>")
     H.append("<h3>محدودیت کاربر هم‌زمان (max_users)</h3><p>مقدار <code>max_users</code> هر کلاینت (پیش‌فرض 0 = نامحدود) تعیین می‌کند چند نفر هم‌زمان می‌توانند با آن اشتراک وصل باشند. پنل هر ~5 ثانیه بررسی می‌کند و نفر اضافه را بلاک می‌کند؛ نفر(های) اول که قبلاً وصل بوده‌اند می‌مانند. رفتار هر پروتکل:</p><ul>"
              "<li><b>VLESS</b> (روی همین سرور و روی نودها): آی‌پی‌های آنلاین هر کاربر از Xray خوانده می‌شود و آی‌پی اضافه فقط برای همان کاربر بلاک می‌شود (اتصال‌های جدید رد می‌شوند). روی نودها تأخیر تشخیص تا ~15 ثانیه است.</li>"
              "<li><b>WireGuard / AmneziaWG</b>: وقتی یک کلید از دو آی‌پی استفاده شود، آی‌پی endpoint مدام بین دو مقدار جابه‌جا می‌شود؛ پنل این الگو را تشخیص می‌دهد و آی‌پی تازه‌وارد را با iptables روی پورت UDP همان اینباند حدود 60 ثانیه بلاک می‌کند (اگر آی‌پی با کلاینت دیگری مشترک باشد، مثلاً پشت یک NAT، بلاک نمی‌شود). جابه‌جایی ساده‌ی شبکه (وای‌فای ↔ دیتا) بلاک نمی‌شود.</li>"
@@ -5489,6 +5710,8 @@ def settings_save():
         raise Err("آیدی تلگرام فقط شامل حرف انگلیسی، عدد و _ باشد (مثلاً sepiamDigee)")
     set_setting("sub_telegram", tgv)
     set_setting("update_interval", num(d.get("update_interval"), 12, 1, 720, "بازه آپدیت"))
+    if "sub_remark" in d:
+        set_setting("sub_remark", oneline(d.get("sub_remark"))[:120])      # خالی = نام ساده (کلاینت-اینباند)
     return jsonify(ok=True)
 
 
@@ -5778,26 +6001,44 @@ def sub_page(c, items, base):
                  "<div class='warnb' style='margin-top:12px'>این لینک را برای دیگران ارسال نکنید؛ با آن می‌توان از اشتراک شما استفاده کرد.</div></section>")
         # --- کانفیگ‌ها ---
         for i, (ci, ib) in enumerate(items):
-            if is_vless(ib):
+            if is_ss(ib):
                 xo = xcfg_of(ib)
-                lk = vless_link(c, ci, ib)
+                lk = ss_link(c, ci, ib)
                 qv = qr_data_uri(lk)
-                sn = _comma(xo["server_names"])[0] if xo["security"] == "reality" else (xo["sni"] or "")
-                info = [("Server", endpoint_str(ib)), ("Transport", xo["transport"].upper()), ("Security", xo["security"].upper())]
-                if sn:
-                    info.append(("SNI", sn))
-                if xo["flow"]:
-                    info.append(("Flow", xo["flow"]))
-                info.append(("UUID", ci["vuuid"]))
-                cells = "".join(cell(f"v{i}_{j}", k, v, k == "UUID") for j, (k, v) in enumerate(info))
-                h.append(f"<section class='card'><div class='ibh'><h3>{E(ib['name'])}</h3><span class='tg2'>VLESS</span>"
+                pw = (pki_of(ib).get("ss_key", "") + ":" + ci["vuuid"]) if xo["ss_method"].startswith("2022-") else ci["vuuid"]
+                cells = "".join(cell(f"v{i}_{j}", k, v, k == "Password") for j, (k, v) in enumerate(
+                    (("Server", endpoint_str(ib)), ("Method", xo["ss_method"]), ("Password", pw))))
+                h.append(f"<section class='card'><div class='ibh'><h3>{E(ib['name'])}</h3><span class='tg2'>Shadowsocks</span>"
                          + (f"<small>{E(ib['remark'])}</small>" if ib["remark"] else "") + "</div>"
                          f"<div class='inf2'>{cells}</div><div class='acts'>"
                          f"<button class='btn p' onclick=\"cp('u{i}')\">{_ic('link')}کپی لینک کانفیگ</button>"
                          + (f"<button class='btn' onclick=\"qt('q{i}')\">{_ic('qr')}QR کد</button>" if qv else "")
                          + "</div>"
                          + (f"<div class='qrb' id='q{i}'><img src='{qv}' alt='QR'><small>در اپ v2rayNG / Hiddify / Streisand / Shadowrocket اسکن کنید</small></div>" if qv else "")
-                         + f"<details><summary>{_ic('link')}لینک کانفیگ <span dir='ltr'>(vless://)</span></summary><pre id='u{i}'>{E(lk)}</pre></details></section>")
+                         + f"<details><summary>{_ic('link')}لینک کانفیگ <span dir='ltr'>(ss://)</span></summary><pre id='u{i}'>{E(lk)}</pre></details></section>")
+                continue
+            if is_vless(ib):
+                xo = xcfg_of(ib)
+                lk = vless_link(c, ci, ib)
+                qv = qr_data_uri(lk)
+                sn = _comma(xo["server_names"])[0] if xo["security"] == "reality" else (xo["sni"] or "")
+                trj = is_trojan(ib)
+                kind = "Trojan" if trj else "VLESS"
+                info = [("Server", endpoint_str(ib)), ("Transport", xo["transport"].upper()), ("Security", xo["security"].upper())]
+                if sn:
+                    info.append(("SNI", sn))
+                if xo["flow"]:
+                    info.append(("Flow", xo["flow"]))
+                info.append(("Password" if trj else "UUID", ci["vuuid"]))
+                cells = "".join(cell(f"v{i}_{j}", k, v, k in ("UUID", "Password")) for j, (k, v) in enumerate(info))
+                h.append(f"<section class='card'><div class='ibh'><h3>{E(ib['name'])}</h3><span class='tg2'>{kind}</span>"
+                         + (f"<small>{E(ib['remark'])}</small>" if ib["remark"] else "") + "</div>"
+                         f"<div class='inf2'>{cells}</div><div class='acts'>"
+                         f"<button class='btn p' onclick=\"cp('u{i}')\">{_ic('link')}کپی لینک کانفیگ</button>"
+                         + (f"<button class='btn' onclick=\"qt('q{i}')\">{_ic('qr')}QR کد</button>" if qv else "")
+                         + "</div>"
+                         + (f"<div class='qrb' id='q{i}'><img src='{qv}' alt='QR'><small>در اپ v2rayNG / Hiddify / Streisand / Shadowrocket اسکن کنید</small></div>" if qv else "")
+                         + f"<details><summary>{_ic('link')}لینک کانفیگ <span dir='ltr'>({kind.lower()}://)</span></summary><pre id='u{i}'>{E(lk)}</pre></details></section>")
                 continue
             if is_ovpn(ib):
                 ov = ovpn_of(ib)
@@ -6147,7 +6388,7 @@ NAV.push(['api','API و مستندات','api','اتصال پنل به ربات �
 const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.'],['api','API و مستندات','api','کلید API خودتان را بسازید، سقف حجم و زمانش را کم و زیاد کنید و ربات یا سایتتان را وصل کنید؛ مصرف فقط از کلاینت‌هایی که با همان کلید ساخته می‌شوند کم می‌شود.']];
 const isA=()=>S&&S.role==='admin';
 function fmtUp(sec){sec=Math.max(0,sec|0);const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);return d?d+'d '+h+'h':h?h+'h '+m+'m':m+'m'}
-function statusBar(){const u=(S.panel&&S.panel.upd)||{},vl=S.inbounds.filter(i=>i.proto==='vless'),vu=vl.filter(i=>i.up).length;
+function statusBar(){const u=(S.panel&&S.panel.upd)||{},vl=S.inbounds.filter(i=>i.proto==='vless'||i.proto==='ss'||i.proto==='trojan'),vu=vl.filter(i=>i.up).length;
  const up=S.panel&&S.panel.started?fmtUp(Date.now()/1000-S.panel.started):'';
  let h=`<button class="sp ok" onclick="statusModal()" title="وضعیت پنل"><i class="dot"></i><b>Sepi</b><span>در حال اجرا</span><em>v${esc(u.current||'')}</em></button>`;
  if(vl.length)h+=`<span class="sp ${vu==vl.length?'ok':vu?'wr':'bd'} sm2"><i class="dot"></i><b>VLESS</b><em>${vu}/${vl.length}</em></span>`;
@@ -6283,12 +6524,12 @@ function nodProg(m,job){const box=m.querySelector('#ndF');m.querySelector('#nd_s
   if(d.state=='run')setTimeout(loop,1500);else load()};loop()}
 /* ---------- اینباندها ---------- */
 function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
- (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.proto==='vless'&&i.xcfg&&i.xcfg.custom_sub?' <span class="tag">ساب کاستوم</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
+ (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.proto==='ss'?' <span class="tag">Shadowsocks</span>':''}${i.proto==='trojan'?' <span class="tag">Trojan</span>':''}${(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')&&i.xcfg&&i.xcfg.custom_sub?' <span class="tag">ساب کاستوم</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
  <span class="b ${i.enabled?(i.up?'ok':'warn'):''}">${i.enabled?(i.up?'بالا':'پایین (خطا؟)'):'غیرفعال'}</span></div>
- <div class="meta"><span>پورت: <b>${i.proto==='l2tp'?'500, 4500/udp':i.proto==='ovpn'?i.port+'/'+esc(i.ovpn.transport):i.proto==='vless'?i.port+'/'+i.net:i.port+'/udp'}</b></span>${i.proto==='vless'?'':`<span>IPv4: <b>${esc(i.address4)}</b></span>`}${i.address6?`<span>IPv6: <b>${esc(i.address6)}</b></span>`:''}
+ <div class="meta"><span>پورت: <b>${i.proto==='l2tp'?'500, 4500/udp':i.proto==='ovpn'?i.port+'/'+esc(i.ovpn.transport):(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')?i.port+'/'+i.net:i.port+'/udp'}</b></span>${(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')?'':`<span>IPv4: <b>${esc(i.address4)}</b></span>`}${i.address6?`<span>IPv6: <b>${esc(i.address6)}</b></span>`:''}
  <span>Endpoint: <b>${esc(i.endpoint||'(آدرس پنل)')}${i.endpoint_port?':'+i.endpoint_port:''}</b></span><span>DNS: <b>${esc(i.dns||'—')}</b></span>
  <span>MTU: <b>${i.mtu||'پیش‌فرض'}</b></span><span>کلاینت: <b>${i.clients}</b></span>
- ${i.proto==='l2tp'?`<span style="cursor:pointer" onclick="copy('${esc(i.psk)}')">IPsec PSK: <b>${esc(i.psk)}</b></span>`:i.proto==='ovpn'?`<span>رمزنگاری: <b>${esc(i.ovpn.cipher)}</b></span>${i.ovpn.tlscrypt?'<span>tls-crypt</span>':''}`:i.proto==='vless'?`<span>${esc(i.xcfg.transport)} + <b>${esc(i.xcfg.security)}</b></span>${i.xcfg.flow?`<span>${esc(i.xcfg.flow)}</span>`:''}${i.xcfg.security==='reality'?`<span style="cursor:pointer" onclick="copy('${esc(i.xcfg.reality_pub)}')">Public Key: <b>${esc((i.xcfg.reality_pub||'').slice(0,12))}…</b></span><span>SNI: <b>${esc((i.xcfg.server_names||'').split(',')[0])}</b></span>`:''}`:`<span style="cursor:pointer" onclick="copy('${esc(i.public_key)}')">کلید عمومی: <b>${esc(i.public_key.slice(0,12))}…</b></span>`}</div>
+ ${i.proto==='l2tp'?`<span style="cursor:pointer" onclick="copy('${esc(i.psk)}')">IPsec PSK: <b>${esc(i.psk)}</b></span>`:i.proto==='ovpn'?`<span>رمزنگاری: <b>${esc(i.ovpn.cipher)}</b></span>${i.ovpn.tlscrypt?'<span>tls-crypt</span>':''}`:i.proto==='ss'?`<span>${esc(i.xcfg.ss_method)}</span><span>${esc(i.xcfg.ss_network)}</span>`:(i.proto==='vless'||i.proto==='trojan')?`<span>${esc(i.xcfg.transport)} + <b>${esc(i.xcfg.security)}</b></span>${i.xcfg.flow?`<span>${esc(i.xcfg.flow)}</span>`:''}${i.xcfg.security==='reality'?`<span style="cursor:pointer" onclick="copy('${esc(i.xcfg.reality_pub)}')">Public Key: <b>${esc((i.xcfg.reality_pub||'').slice(0,12))}…</b></span><span>SNI: <b>${esc((i.xcfg.server_names||'').split(',')[0])}</b></span>`:''}`:`<span style="cursor:pointer" onclick="copy('${esc(i.public_key)}')">کلید عمومی: <b>${esc(i.public_key.slice(0,12))}…</b></span>`}</div>
  <div class="acts"><button class="s" onclick="editInb(${i.id})">ویرایش</button><button class="s" onclick="showConf(${i.id})">کانفیگ سرور</button>
  <button class="s" onclick="act(()=>api('/inbounds/${i.id}/restart','POST'),'ری‌استارت شد')">ری‌استارت</button>
  <button class="s" onclick="act(()=>api('/inbounds/${i.id}/toggle','POST'))">${i.enabled?'غیرفعال‌سازی':'فعال‌سازی'}</button>
@@ -6325,22 +6566,23 @@ async function testDest(){try{const d=$('#f_x_reality_dest').value||'www.microso
 async function genObf(){try{const r=await api('/obf/generate?v='+$('#f_obf_ver').value);for(const [k] of OBF){const e=$('#f_o_'+k);if(e)e.value=r[k]||''}$('#f_obf_enabled').checked=true;toast('پارامترهای جدید ساخته شد')}catch(e){toast(e.message,1)}}
 const XFP=['chrome','firefox','safari','ios','android','edge','360','qq','random','randomized',''];
 const INB=[{s:'اصلی',tab:'پایه'},
- {k:'proto',l:'پروتکل',t:'select',opts:[['wg','WireGuard'],['l2tp','L2TP/IPsec — برای مودم، روتر و گوشی (بدون نیاز به اپ)'],['ovpn','OpenVPN — اپ OpenVPN، مودم و روتر (UDP/TCP)'],['vless','VLESS — Xray (Reality / TLS / WS / gRPC / xHTTP / mKCP)']],lock:1,h:'پروتکل بعد از ساخت اینباند قابل تغییر نیست. از L2TP فقط یک اینباند می‌شود ساخت.'},
- {k:'node_id',l:'نود (سروری که این اینباند روی آن ساخته می‌شود)',t:'select',p:'vless',lock:1,opts:()=>[['0','این سرور (پنل اصلی)'],...(S.nodes||[]).map(n=>[String(n.id),esc(n.name)+' — '+esc(n.address)])],h:'بعد از ساخت قابل تغییر نیست. روی نود، گواهی «پنل» عیناً به نود کپی می‌شود و مسیر «فایل گواهی» باید روی خود نود باشد. لینک کلاینت‌ها به آدرس همان نود می‌رود.'},
+ {k:'proto',l:'پروتکل',t:'select',opts:[['wg','WireGuard'],['l2tp','L2TP/IPsec — برای مودم، روتر و گوشی (بدون نیاز به اپ)'],['ovpn','OpenVPN — اپ OpenVPN، مودم و روتر (UDP/TCP)'],['vless','VLESS — Xray (Reality / TLS / WS / gRPC / xHTTP / mKCP)'],['ss','Shadowsocks — Xray (۲۰۲۲ و AEAD؛ TCP/UDP)'],['trojan','Trojan — Xray (TLS / Reality / WS / gRPC / xHTTP / mKCP)']],lock:1,h:'پروتکل بعد از ساخت اینباند قابل تغییر نیست. از L2TP فقط یک اینباند می‌شود ساخت.'},
+ {k:'node_id',l:'نود (سروری که این اینباند روی آن ساخته می‌شود)',t:'select',p:'vless ss trojan',lock:1,opts:()=>[['0','این سرور (پنل اصلی)'],...(S.nodes||[]).map(n=>[String(n.id),esc(n.name)+' — '+esc(n.address)])],h:'بعد از ساخت قابل تغییر نیست. روی نود، گواهی «پنل» عیناً به نود کپی می‌شود و مسیر «فایل گواهی» باید روی خود نود باشد. لینک کلاینت‌ها به آدرس همان نود می‌رود.'},
  {k:'name',l:'نام اینباند',h:'مثل wg0 یا l2tp — حداکثر ۱۵ حرف انگلیسی'},{k:'remark',l:'توضیح',rtl:1},
- {k:'port',l:'پورت',t:'number',p:'wg ovpn vless',h:'وایرگارد UDP است؛ OpenVPN پیش‌فرض 1194 (برای عبور از فیلتر می‌توانید TCP/443 بگذارید)'},{k:'address4',l:'آدرس سرور IPv4 / ساب‌نت',ph:'10.8.0.1/24',p:'wg l2tp ovpn',h:'در L2TP: آی‌پی گیت‌وی داخل VPN؛ بقیه‌ی رنج به کلاینت‌ها داده می‌شود'},
+ {k:'port',l:'پورت',t:'number',p:'wg ovpn vless ss trojan',h:'وایرگارد UDP است؛ OpenVPN پیش‌فرض 1194 (برای عبور از فیلتر می‌توانید TCP/443 بگذارید)'},{k:'address4',l:'آدرس سرور IPv4 / ساب‌نت',ph:'10.8.0.1/24',p:'wg l2tp ovpn',h:'در L2TP: آی‌پی گیت‌وی داخل VPN؛ بقیه‌ی رنج به کلاینت‌ها داده می‌شود'},
  {k:'psk',l:'کلید IPsec (Pre-shared key)',p:'l2tp',h:'همه‌ی کلاینت‌ها همین کلید را در مودم/روتر وارد می‌کنند. پورت‌های UDP ‏500 و 4500 را در فایروال باز کنید.'},
  {k:'address6',l:'آدرس سرور IPv6 (اختیاری)',ph:'fd42:42:0::1/64',h:'خالی = بدون IPv6',p:'wg'},
  {k:'private_key',l:'کلید خصوصی سرور',h:'خالی = ساخت خودکار (در ویرایش: خالی = بدون تغییر)',p:'wg'},
- {k:'regen_keys',l:'ساخت دوباره کلید سرور / CA (کلاینت‌ها باید کانفیگ جدید بگیرند)',t:'check',edit:1,p:'wg ovpn vless'},
+ {k:'regen_keys',l:'ساخت دوباره کلید سرور / CA (کلاینت‌ها باید کانفیگ جدید بگیرند)',t:'check',edit:1,p:'wg ovpn vless ss trojan'},
  {s:'اتصال کلاینت‌ها',tab:'اتصال'},
  {k:'endpoint',l:'آدرس عمومی سرور (Endpoint)',h:'IP یا دامنه. خالی = همان آدرسی که پنل با آن باز شده'},
- {k:'endpoint_port',l:'پورت Endpoint',t:'number',h:'۰ = همان پورت listen (برای پورت‌فوروارد/NAT/CDN). در VLESS: پورتی که داخل لینک کلاینت می‌آید',p:'wg ovpn vless'},
+ {k:'endpoint_port',l:'پورت Endpoint',t:'number',h:'۰ = همان پورت listen (برای پورت‌فوروارد/NAT/CDN). در VLESS/Shadowsocks: پورتی که داخل لینک کلاینت می‌آید',p:'wg ovpn vless ss trojan'},
  {k:'dns',l:'DNS کلاینت',ph:'1.1.1.1, 1.0.0.1',p:'wg l2tp ovpn'},{k:'client_mtu',l:'MTU کلاینت',t:'number',h:'۰ = همان MTU سرور',p:'wg'},
  {k:'client_allowed_ips',l:'AllowedIPs کلاینت',h:'0.0.0.0/0, ::/0 = تمام ترافیک از تونل',p:'wg'},
  {k:'client_keepalive',l:'PersistentKeepalive (ثانیه)',t:'number',h:'۰ = خاموش، ۲۵ = پیشنهادی پشت NAT',p:'wg'},
  {k:'use_psk',l:'PresharedKey جداگانه برای هر کلاینت (امنیت بیشتر)',t:'check',p:'wg'},
  {k:'exclude_sub',l:'حذف از اشتراک‌ها (کلاینت‌ها این اینباند را در لینک ساب نمی‌بینند)',t:'check'},
+ {k:'x_custom_sub',l:'می‌خوای کانفیگ‌های این اینباند توی «ساب کاستوم» باشه؟ (کانفیگ کامل JSON مثل v2rayNG، به‌جای لینک)',t:'check',sw:1,p:'vless ss trojan',h:'روشن: این اینباند از ساب معمولی خارج می‌شود و کانفیگ‌هایش (JSON کامل Xray با پراکسی محلی 10808/10809) در لینک جداگانهٔ «ساب کاستوم» هر کلاینت می‌آید (آدرس: ساب/custom). خاموش: مثل قبل با لینک vless:// در ساب معمولی.'},
  {s:'تنظیمات OpenVPN',tab:'OpenVPN',p:'ovpn'},
  {k:'v_transport',l:'ترنسپورت',t:'select',p:'ovpn',opts:[['udp','UDP — سریع‌تر (پیشنهادی)'],['tcp','TCP — برای شبکه‌های محدود، مثلاً پورت 443']]},
  {k:'v_cipher',l:'رمزنگاری دیتا',t:'select',p:'ovpn',opts:[['AES-256-GCM','AES-256-GCM (پیشنهادی)'],['AES-128-GCM','AES-128-GCM'],['CHACHA20-POLY1305','CHACHA20-POLY1305 (موبایل/مودم بدون AES سخت‌افزاری)'],['AES-256-CBC','AES-256-CBC (قدیمی)'],['AES-128-CBC','AES-128-CBC (قدیمی)']]},
@@ -6351,51 +6593,53 @@ const INB=[{s:'اصلی',tab:'پایه'},
  {k:'v_legacy',l:'سازگاری با کلاینت‌های قدیمی (OpenVPN 2.3 و مودم‌های قدیمی: ncp-ciphers)',t:'check',p:'ovpn'},
  {k:'v_extra_server',l:'دستورات اضافه سرور (هر خط یک دستور)',t:'textarea',p:'ovpn',h:'دستورات خطرناک مثل script-security/up/plugin مسدودند.'},
  {k:'v_extra_client',l:'دستورات اضافه کلاینت (هر خط یک دستور)',t:'textarea',p:'ovpn',h:'مثلاً: compress / tun-mtu / http-proxy'},
- {s:'تنظیمات VLESS (Xray-core)',tab:'VLESS',p:'vless'},
- {k:'x_transport',l:'ترنسپورت (Network)',t:'select',p:'vless',opts:[['tcp','TCP (RAW) — با Reality/Vision بهترین حالت'],['ws','WebSocket — پشت CDN'],['grpc','gRPC'],['httpupgrade','HTTPUpgrade'],['xhttp','xHTTP (SplitHTTP) — جدیدترین'],['kcp','mKCP (UDP)']]},
- {k:'x_security',l:'امنیت (Security)',t:'select',p:'vless',opts:[['reality','Reality — بدون نیاز به دامنه و گواهی (پیشنهادی)'],['tls','TLS — با دامنه و گواهی'],['none','بدون رمزنگاری (فقط پشت CDN/پروکسی)']],h:'Reality فقط با TCP، gRPC و xHTTP کار می‌کند؛ mKCP فقط بدون امنیت.'},
+ {s:'تنظیمات Shadowsocks (Xray-core)',tab:'Shadowsocks',p:'ss'},
+ {k:'x_ss_method',l:'متد رمزنگاری',t:'select',p:'ss',opts:[['2022-blake3-aes-128-gcm','2022-blake3-aes-128-gcm (پیشنهادی؛ چندکاربره)'],['2022-blake3-aes-256-gcm','2022-blake3-aes-256-gcm (چندکاربره)'],['aes-256-gcm','aes-256-gcm (AEAD قدیمی؛ سازگاری بالا)'],['aes-128-gcm','aes-128-gcm (AEAD قدیمی)'],['chacha20-ietf-poly1305','chacha20-ietf-poly1305 (AEAD قدیمی؛ مناسب موبایل)'],['xchacha20-ietf-poly1305','xchacha20-ietf-poly1305 (AEAD قدیمی)']],h:'روی اینباندی که کلاینت دارد قابل تغییر نیست. در متدهای 2022 کلید سرور خودکار ساخته می‌شود و هر کلاینت کلید مخصوص خودش را دارد؛ لینک ss:// همه را داخل خودش دارد.'},
+ {k:'x_ss_network',l:'شبکه',t:'select',p:'ss',opts:[['tcp,udp','TCP + UDP (پیشنهادی)'],['tcp','فقط TCP'],['udp','فقط UDP']],h:'هر دو پورت (TCP و UDP) در فایروال باز می‌شوند (اگر «قوانین فایروال خودکار» روشن باشد).'},
+ {s:'تنظیمات VLESS / Trojan (Xray-core)',tab:'VLESS / Trojan',p:'vless trojan'},
+ {k:'x_transport',l:'ترنسپورت (Network)',t:'select',p:'vless trojan',opts:[['tcp','TCP (RAW) — با Reality/Vision بهترین حالت'],['ws','WebSocket — پشت CDN'],['grpc','gRPC'],['httpupgrade','HTTPUpgrade'],['xhttp','xHTTP (SplitHTTP) — جدیدترین'],['kcp','mKCP (UDP)']]},
+ {k:'x_security',l:'امنیت (Security)',t:'select',p:'vless trojan',opts:[['reality','Reality — بدون نیاز به دامنه و گواهی (پیشنهادی)'],['tls','TLS — با دامنه و گواهی'],['none','بدون رمزنگاری (فقط پشت CDN/پروکسی)']],h:'Reality فقط با TCP، gRPC و xHTTP کار می‌کند؛ mKCP فقط بدون امنیت.'},
  {k:'x_flow',l:'Flow',t:'select',p:'vless',w:'x_transport=tcp,x_security=tls|reality',opts:[['xtls-rprx-vision','xtls-rprx-vision (پیشنهادی)'],['','بدون flow']]},
- {k:'x_fp',l:'Fingerprint کلاینت (uTLS)',t:'select',p:'vless',w:'x_security=tls|reality',opts:XFP.map(a=>[a,a||'بدون'])},
+ {k:'x_fp',l:'Fingerprint کلاینت (uTLS)',t:'select',p:'vless trojan',w:'x_security=tls|reality',opts:XFP.map(a=>[a,a||'بدون'])},
  {k:'x_packet_encoding',l:'Packet Encoding',t:'select',p:'vless',opts:[['','پیش‌فرض'],['xudp','xudp (پیشنهادی برای UDP/بازی)'],['packet','packet']]},
- {k:'x_custom_sub',l:'می‌خوای کانفیگ‌های این اینباند توی «ساب کاستوم» باشه؟ (کانفیگ کامل JSON مثل v2rayNG، به‌جای لینک vless://)',t:'check',sw:1,p:'vless',h:'روشن: این اینباند از ساب معمولی خارج می‌شود و کانفیگ‌هایش (JSON کامل Xray با پراکسی محلی 10808/10809) در لینک جداگانهٔ «ساب کاستوم» هر کلاینت می‌آید (آدرس: ساب/custom). خاموش: مثل قبل با لینک vless:// در ساب معمولی.'},
- {s:'Reality',tab:'Reality',p:'vless',w:'x_security=reality'},
- {k:'x_reality_dest',l:'Dest (سایت مقصد برای Reality)',p:'vless',w:'x_security=reality',ph:'www.microsoft.com:443',h:'سایتی که TLS 1.3 و h2 داشته باشد و در کشور شما فیلتر نباشد.'},
- {t:'btn',l:'تست Dest (TLS1.3 / h2)',on:'testDest()',p:'vless',w:'x_security=reality'},
- {t:'html',p:'vless',w:'x_security=reality',html:SCAN_HTML},
- {k:'x_server_names',l:'SNI ها (serverNames، با کاما)',p:'vless',w:'x_security=reality',ph:'www.microsoft.com',h:'خالی = همان دامین Dest. اولین مورد در لینک کلاینت می‌آید.'},
- {k:'x_short_ids',l:'Short IDها (با کاما)',p:'vless',w:'x_security=reality',h:'خالی = ساخت خودکار. hex زوج، ۲ تا ۱۶ کاراکتر.'},
- {k:'x_spider_x',l:'SpiderX',p:'vless',w:'x_security=reality',ph:'/'},
- {k:'x_reality_priv',l:'کلید خصوصی Reality (اختیاری)',p:'vless',w:'x_security=reality',h:'خالی = ساخت خودکار / بدون تغییر. کلید عمومی در کارت اینباند نمایش داده می‌شود.'},
- {s:'TLS',tab:'TLS',p:'vless',w:'x_security=tls'},
- {k:'x_tls_mode',l:'منبع گواهی',t:'select',p:'vless',w:'x_security=tls',opts:[['panel','گواهی پنل (دامنهٔ ثبت‌شده در sepipanel)'],['files','فایل‌های گواهی روی سرور'],['self','خودامضا (برای تست/پشت CDN)']]},
- {k:'x_tls_cert',l:'مسیر fullchain.pem',p:'vless',w:'x_security=tls,x_tls_mode=files',ph:'/etc/letsencrypt/live/example.com/fullchain.pem'},
- {k:'x_tls_key',l:'مسیر privkey.pem',p:'vless',w:'x_security=tls,x_tls_mode=files',ph:'/etc/letsencrypt/live/example.com/privkey.pem'},
- {k:'x_sni',l:'SNI',p:'vless',w:'x_security=tls',ph:'example.com',h:'خالی = آدرس سرور'},
- {k:'x_alpn',l:'ALPN (با کاما)',p:'vless',w:'x_security=tls',ph:'h2,http/1.1'},
- {k:'x_min_ver',l:'حداقل نسخه TLS',t:'select',p:'vless',w:'x_security=tls',opts:[['1.2','1.2'],['1.3','1.3'],['1.1','1.1'],['1.0','1.0']]},
- {k:'x_reject_sni',l:'رد SNI ناشناخته (rejectUnknownSni)',t:'check',p:'vless',w:'x_security=tls'},
- {k:'x_allow_insecure',l:'کلاینت اعتبارسنجی گواهی را رد کند (allowInsecure)',t:'check',p:'vless',w:'x_security=tls'},
- {s:'جزئیات ترنسپورت',tab:'ترنسپورت',p:'vless'},
- {k:'x_tcp_header',l:'Header TCP',t:'select',p:'vless',w:'x_transport=tcp',opts:[['none','none'],['http','http (استتار HTTP)']]},
- {k:'x_path',l:'Path',p:'vless',w:'x_transport=ws|httpupgrade|xhttp|tcp',ph:'/'},
- {k:'x_host',l:'Host',p:'vless',w:'x_transport=ws|httpupgrade|xhttp|tcp',h:'برای WS/CDN معمولاً همان دامنه'},
- {k:'x_xhttp_mode',l:'حالت xHTTP',t:'select',p:'vless',w:'x_transport=xhttp',opts:[['auto','auto'],['packet-up','packet-up'],['stream-up','stream-up'],['stream-one','stream-one']]},
- {k:'x_service_name',l:'Service Name (gRPC)',p:'vless',w:'x_transport=grpc',h:'خالی = تصادفی'},
- {k:'x_authority',l:'Authority (gRPC)',p:'vless',w:'x_transport=grpc'},
- {k:'x_multi_mode',l:'Multi Mode (gRPC)',t:'check',p:'vless',w:'x_transport=grpc'},
- {k:'x_kcp_header',l:'Header mKCP',t:'select',p:'vless',w:'x_transport=kcp',opts:[['none','none'],['srtp','srtp'],['utp','utp'],['wechat-video','wechat-video'],['dtls','dtls'],['wireguard','wireguard']]},
- {k:'x_kcp_seed',l:'Seed (mKCP)',p:'vless',w:'x_transport=kcp'},
- {s:'Fallback، Sniffing و مسیریابی',tab:'Sniffing و مسیر',p:'vless'},
- {k:'x_fallback_dest',l:'Fallback Dest (فقط TCP + TLS)',p:'vless',w:'x_transport=tcp,x_security=tls',ph:'80 یا 127.0.0.1:8080',h:'درخواست‌های غیر VLESS به این مقصد می‌روند (مثلاً یک وب‌سایت).'},
- {k:'x_fallback_xver',l:'Fallback xver (PROXY protocol)',t:'number',p:'vless',w:'x_transport=tcp,x_security=tls'},
- {k:'x_sniffing',l:'Sniffing (تشخیص http/tls/quic)',t:'check',p:'vless'},
- {k:'x_route_only',l:'Route Only (فقط برای مسیریابی)',t:'check',p:'vless',w:'x_sniffing=1'},
- {k:'x_block_bt',l:'مسدود کردن BitTorrent',t:'check',p:'vless',h:'نیاز به Sniffing فعال دارد.'},
- {k:'x_block_private',l:'مسدود کردن آی‌پی‌های خصوصی/محلی (جلوگیری از دسترسی به شبکهٔ سرور)',t:'check',p:'vless'},
- {k:'x_domain_strategy',l:'Domain Strategy خروجی',t:'select',p:'vless',opts:[['AsIs','AsIs'],['UseIP','UseIP'],['UseIPv4','UseIPv4'],['UseIPv6','UseIPv6']]},
- {k:'x_listen',l:'Listen',p:'vless',ph:'0.0.0.0',h:'برای IPv6 هم: ::'},
- {k:'x_tfo',l:'TCP Fast Open',t:'check',p:'vless'},
- {k:'x_extra_stream',l:'JSON اضافه برای streamSettings (پیشرفته)',t:'textarea',p:'vless',h:'مثلاً {"sockopt":{"tcpKeepAliveIdle":300}} — با تنظیمات بالا ادغام می‌شود.'},
+ {s:'Reality',tab:'Reality',p:'vless trojan',w:'x_security=reality'},
+ {k:'x_reality_dest',l:'Dest (سایت مقصد برای Reality)',p:'vless trojan',w:'x_security=reality',ph:'www.microsoft.com:443',h:'سایتی که TLS 1.3 و h2 داشته باشد و در کشور شما فیلتر نباشد.'},
+ {t:'btn',l:'تست Dest (TLS1.3 / h2)',on:'testDest()',p:'vless trojan',w:'x_security=reality'},
+ {t:'html',p:'vless trojan',w:'x_security=reality',html:SCAN_HTML},
+ {k:'x_server_names',l:'SNI ها (serverNames، با کاما)',p:'vless trojan',w:'x_security=reality',ph:'www.microsoft.com',h:'خالی = همان دامین Dest. اولین مورد در لینک کلاینت می‌آید.'},
+ {k:'x_short_ids',l:'Short IDها (با کاما)',p:'vless trojan',w:'x_security=reality',h:'خالی = ساخت خودکار. hex زوج، ۲ تا ۱۶ کاراکتر.'},
+ {k:'x_spider_x',l:'SpiderX',p:'vless trojan',w:'x_security=reality',ph:'/'},
+ {k:'x_reality_priv',l:'کلید خصوصی Reality (اختیاری)',p:'vless trojan',w:'x_security=reality',h:'خالی = ساخت خودکار / بدون تغییر. کلید عمومی در کارت اینباند نمایش داده می‌شود.'},
+ {s:'TLS',tab:'TLS',p:'vless trojan',w:'x_security=tls'},
+ {k:'x_tls_mode',l:'منبع گواهی',t:'select',p:'vless trojan',w:'x_security=tls',opts:[['panel','گواهی پنل (دامنهٔ ثبت‌شده در sepipanel)'],['files','فایل‌های گواهی روی سرور'],['self','خودامضا (برای تست/پشت CDN)']]},
+ {k:'x_tls_cert',l:'مسیر fullchain.pem',p:'vless trojan',w:'x_security=tls,x_tls_mode=files',ph:'/etc/letsencrypt/live/example.com/fullchain.pem'},
+ {k:'x_tls_key',l:'مسیر privkey.pem',p:'vless trojan',w:'x_security=tls,x_tls_mode=files',ph:'/etc/letsencrypt/live/example.com/privkey.pem'},
+ {k:'x_sni',l:'SNI',p:'vless trojan',w:'x_security=tls',ph:'example.com',h:'خالی = آدرس سرور'},
+ {k:'x_alpn',l:'ALPN (با کاما)',p:'vless trojan',w:'x_security=tls',ph:'h2,http/1.1'},
+ {k:'x_min_ver',l:'حداقل نسخه TLS',t:'select',p:'vless trojan',w:'x_security=tls',opts:[['1.2','1.2'],['1.3','1.3'],['1.1','1.1'],['1.0','1.0']]},
+ {k:'x_reject_sni',l:'رد SNI ناشناخته (rejectUnknownSni)',t:'check',p:'vless trojan',w:'x_security=tls'},
+ {k:'x_allow_insecure',l:'کلاینت اعتبارسنجی گواهی را رد کند (allowInsecure)',t:'check',p:'vless trojan',w:'x_security=tls'},
+ {s:'جزئیات ترنسپورت',tab:'ترنسپورت',p:'vless trojan'},
+ {k:'x_tcp_header',l:'Header TCP',t:'select',p:'vless trojan',w:'x_transport=tcp',opts:[['none','none'],['http','http (استتار HTTP)']]},
+ {k:'x_path',l:'Path',p:'vless trojan',w:'x_transport=ws|httpupgrade|xhttp|tcp',ph:'/'},
+ {k:'x_host',l:'Host',p:'vless trojan',w:'x_transport=ws|httpupgrade|xhttp|tcp',h:'برای WS/CDN معمولاً همان دامنه'},
+ {k:'x_xhttp_mode',l:'حالت xHTTP',t:'select',p:'vless trojan',w:'x_transport=xhttp',opts:[['auto','auto'],['packet-up','packet-up'],['stream-up','stream-up'],['stream-one','stream-one']]},
+ {k:'x_service_name',l:'Service Name (gRPC)',p:'vless trojan',w:'x_transport=grpc',h:'خالی = تصادفی'},
+ {k:'x_authority',l:'Authority (gRPC)',p:'vless trojan',w:'x_transport=grpc'},
+ {k:'x_multi_mode',l:'Multi Mode (gRPC)',t:'check',p:'vless trojan',w:'x_transport=grpc'},
+ {k:'x_kcp_header',l:'Header mKCP',t:'select',p:'vless trojan',w:'x_transport=kcp',opts:[['none','none'],['srtp','srtp'],['utp','utp'],['wechat-video','wechat-video'],['dtls','dtls'],['wireguard','wireguard']]},
+ {k:'x_kcp_seed',l:'Seed (mKCP)',p:'vless trojan',w:'x_transport=kcp'},
+ {s:'Fallback، Sniffing و مسیریابی',tab:'Sniffing و مسیر',p:'vless ss trojan'},
+ {k:'x_fallback_dest',l:'Fallback Dest (فقط TCP + TLS)',p:'vless trojan',w:'x_transport=tcp,x_security=tls',ph:'80 یا 127.0.0.1:8080',h:'درخواست‌های غیر VLESS/Trojan به این مقصد می‌روند (مثلاً یک وب‌سایت).'},
+ {k:'x_fallback_xver',l:'Fallback xver (PROXY protocol)',t:'number',p:'vless trojan',w:'x_transport=tcp,x_security=tls'},
+ {k:'x_sniffing',l:'Sniffing (تشخیص http/tls/quic)',t:'check',p:'vless ss trojan'},
+ {k:'x_route_only',l:'Route Only (فقط برای مسیریابی)',t:'check',p:'vless ss trojan',w:'x_sniffing=1'},
+ {k:'x_block_bt',l:'مسدود کردن BitTorrent',t:'check',p:'vless ss trojan',h:'نیاز به Sniffing فعال دارد.'},
+ {k:'x_block_private',l:'مسدود کردن آی‌پی‌های خصوصی/محلی (جلوگیری از دسترسی به شبکهٔ سرور)',t:'check',p:'vless ss trojan'},
+ {k:'x_domain_strategy',l:'Domain Strategy خروجی',t:'select',p:'vless ss trojan',opts:[['AsIs','AsIs'],['UseIP','UseIP'],['UseIPv4','UseIPv4'],['UseIPv6','UseIPv6']]},
+ {k:'x_listen',l:'Listen',p:'vless ss trojan',ph:'0.0.0.0',h:'برای IPv6 هم: ::'},
+ {k:'x_tfo',l:'TCP Fast Open',t:'check',p:'vless ss trojan'},
+ {k:'x_extra_stream',l:'JSON اضافه برای streamSettings (پیشرفته)',t:'textarea',p:'vless trojan',h:'مثلاً {"sockopt":{"tcpKeepAliveIdle":300}} — با تنظیمات بالا ادغام می‌شود.'},
  {s:'پیشرفته (سرور)',tab:'پیشرفته'},
 
  {k:'mtu',l:'MTU اینترفیس سرور',t:'number',p:'wg l2tp ovpn',h:'۰ = پیش‌فرض (وایرگارد 1420، L2TP ‏1400، OpenVPN خودکار)'},
@@ -6428,11 +6672,11 @@ function formModal(title,fields,vals,edit,onSave){
  const fixTab=()=>{const on=m.querySelector('.tb.on');if(on&&on.style.display==='none'){const f=[...m.querySelectorAll('.tb')].find(b=>b.style.display!=='none');if(f)showTab(m,f.dataset.t)}};
  const ps=m.querySelector('#f_proto');
  if(ps){const g=k=>m.querySelector('#f_'+k);const w={port:g('port')&&g('port').value,mtu:g('mtu')&&g('mtu').value};
-   const DM={wg:{name:g('name')&&g('name').value,port:w.port,mtu:w.mtu},l2tp:{name:'l2tp',mtu:'1400'},ovpn:{name:'ovpn',port:'1194',mtu:'0'},vless:{name:'vless',port:'443'}};
+   const DM={wg:{name:g('name')&&g('name').value,port:w.port,mtu:w.mtu},l2tp:{name:'l2tp',mtu:'1400'},ovpn:{name:'ovpn',port:'1194',mtu:'0'},vless:{name:'vless',port:'443',x_security:'reality',x_flow:'xtls-rprx-vision'},ss:{name:'ss',port:'8388'},trojan:{name:'trojan',port:'443',x_security:'tls',x_flow:''}};let lastP=null;
    const val=k=>{const e=g(k);return e?(e.type==='checkbox'?(e.checked?'1':'0'):e.value):''};
    const okW=w=>!w||w.split(',').every(c=>{const [k,vs]=c.split('=');return vs.split('|').includes(val(k))});
-   const ap=()=>{m.querySelectorAll('[data-p],[data-w]').forEach(e=>e.style.display=((!e.dataset.p||e.dataset.p.split(' ').includes(ps.value))&&okW(e.dataset.w))?'':'none');
-     if(!edit){const d=DM[ps.value];for(const k of ['name','port','mtu']){const e=g(k);if(e&&d[k]!=null&&(k!=='name'||/^(wg\d*|l2tp|ovpn|vless)$/.test(e.value)))e.value=d[k]}}};
+   const ap=()=>{if(!edit&&ps.value!==lastP){lastP=ps.value;const d=DM[ps.value]||{};for(const k of ['name','port','mtu','x_security','x_flow']){const e=g(k);if(e&&d[k]!=null&&(k!=='name'||/^(wg\\d*|l2tp|ovpn|vless|ss|trojan)$/.test(e.value)))e.value=d[k]}}
+     m.querySelectorAll('[data-p],[data-w]').forEach(e=>e.style.display=((!e.dataset.p||e.dataset.p.split(' ').includes(ps.value))&&okW(e.dataset.w))?'':'none')};
    const ap2=()=>{ap();fixTab()};ps.onchange=ap2;m.addEventListener('change',ap2);ap2()}
  m.querySelector('#ms').onclick=async()=>{if(await onSave(collect(fields,edit)))m.remove()}}
 function newInb(pre={}){const d=S.defaults;formModal('اینباند جدید',INB,{...d,obf_ver:'3',proto:'wg',...Object.fromEntries(Object.entries(d.ovpn||{}).map(([k,v])=>['v_'+k,v])),...Object.fromEntries(Object.entries(d.xcfg||{}).map(([k,v])=>['x_'+k,v])),...pre},false,o=>act(()=>api('/inbounds','POST',o),'اینباند ساخته شد'))}
@@ -6478,7 +6722,7 @@ const CLI=[{k:'name',l:'نام کلاینت',rtl:1},{k:'count',l:'تعداد (س
  {k:'max_users',l:'تعداد کاربر همزمان',t:'number',h:'۰ = نامحدود. مثلاً ۱ یعنی فقط یک نفر (یک آی‌پی) هم‌زمان می‌تواند وصل باشد و نفر دوم بلاک می‌شود. روی VLESS (سرور و نودها)، وایرگارد/AmneziaWG و L2TP اعمال می‌شود؛ OpenVPN خودش برای هر حساب فقط یک نشست نگه می‌دارد.'},
  {k:'reset_period',l:'ریست خودکار ترافیک',t:'select',opts:[['','هرگز'],['daily','روزانه'],['weekly','هفتگی'],['monthly','ماهانه (هر ۳۰ روز)']]}];
 function linkBlock(ib,L){const v=L||{};const f=(k,l,ph)=>`<div class="fg"><label>${l}</label><input class="l_${k}" value="${esc(v[k]??'')}" placeholder="${ph||''}"></div>`;
- return `<div class="lk" data-ib="${ib.id}"><label class="chk"><input type="checkbox" class="lkc" ${L?'checked':''}> <b>${esc(ib.name)}</b> <span class="mut">${esc(ib.remark)}${ib.proto==='vless'?'':' · '+esc(ib.address4)}</span>${ib.proto==='l2tp'?' <span class="tag">L2TP</span>':''}${ib.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${ib.proto==='vless'?' <span class="tag">VLESS</span>':''}${ib.node_id?` <span class="tag">${esc(nodName(ib.node_id))}</span>`:''}</label>
+ return `<div class="lk" data-ib="${ib.id}"><label class="chk"><input type="checkbox" class="lkc" ${L?'checked':''}> <b>${esc(ib.name)}</b> <span class="mut">${esc(ib.remark)}${(ib.proto==='vless'||ib.proto==='ss'||ib.proto==='trojan')?'':' · '+esc(ib.address4)}</span>${ib.proto==='l2tp'?' <span class="tag">L2TP</span>':''}${ib.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${ib.proto==='vless'?' <span class="tag">VLESS</span>':''}${ib.proto==='ss'?' <span class="tag">Shadowsocks</span>':''}${ib.proto==='trojan'?' <span class="tag">Trojan</span>':''}${ib.node_id?` <span class="tag">${esc(nodName(ib.node_id))}</span>`:''}</label>
  <details ${isA()||ib.proto!=='wg'?'hidden':''}><summary>تنظیمات ویژه این کلاینت در این اینباند</summary><div class="g2">${f('ip4','IPv4 ثابت','خودکار')}${f('allowed_ips','AllowedIPs کلاینت','پیش‌فرض اینباند')}
  ${f('keepalive','Keepalive','پیش‌فرض اینباند (۰=خاموش)')}${f('dns','DNS','پیش‌فرض اینباند')}${f('mtu','MTU','پیش‌فرض اینباند')}${f('extra_allowed','AllowedIPs اضافه سمت سرور','مثلا 192.168.50.0/24')}</div></details></div>`}
 function cliModal(title,c){const vals=c?{...c,limit_gb:c.limit_bytes?+(c.limit_bytes/1024**3).toFixed(3):0}:{limit_gb:0,max_users:0,count:1};
@@ -6505,7 +6749,7 @@ function subModal(id){const c=S.clients.find(x=>x.id==id);const u=c.sub_url;
  <div class="acts"><button class="s" id="b1">کپی لینک</button><button class="s" onclick="window.open('${esc(u)}?format=html')">صفحه اشتراک</button>
  <button class="s" onclick="window.open('${esc(u)}?format=conf')">همه کانفیگ‌ها (.conf)</button><button class="s" onclick="window.open('${esc(u)}?format=raw')">لینک‌های wireguard://</button></div>
  <h4>دانلود تک‌تک</h4><div class="acts">${c.links.filter(l=>l.proto==='wg'||l.proto==='ovpn').map(l=>`<a class="btn" href="/sub/${c.token}/${l.inbound_id}.${l.proto==='ovpn'?'ovpn':'conf'}">${esc(l.ib_name)}.${l.proto==='ovpn'?'ovpn':'conf'}</a>`).join('')||'<span class="mut">—</span>'}</div>
- ${c.links.filter(l=>l.proto==='vless').map(l=>`<h4>${esc(l.ib_name)} — VLESS</h4><div class="acts"><button class="btn" onclick="copy(this.dataset.v)" data-v="${esc(l.vlink||'')}">کپی لینک vless://</button></div>`).join('')}
+ ${c.links.filter(l=>l.proto==='vless'||l.proto==='ss'||l.proto==='trojan').map(l=>`<h4>${esc(l.ib_name)} — ${l.proto==='ss'?'Shadowsocks':l.proto==='trojan'?'Trojan':'VLESS'}</h4><div class="acts"><button class="btn" onclick="copy(this.dataset.v)" data-v="${esc(l.vlink||'')}">کپی لینک ${l.proto==='ss'?'ss://':l.proto==='trojan'?'trojan://':'vless://'}</button></div>`).join('')}
  ${c.links.filter(l=>l.proto==='l2tp').map(l=>{const ib=S.inbounds.find(x=>x.id==l.inbound_id)||{};const cv=(k,v)=>`<span style="cursor:pointer" onclick="copy('${esc(v)}')">${k}: <b>${esc(v)}</b></span>`;
   return `<h4>${esc(l.ib_name)} — L2TP/IPsec</h4><div class="meta">${cv('Server',ib.endpoint||location.hostname)}${cv('Username',l.l2tp_user)}${cv('Password',l.l2tp_pass)}${cv('IPsec PSK',ib.psk||'')}</div>`}).join('')}
  <h4>امنیت</h4><div class="acts"><button class="s d" id="b2">ساخت لینک ساب جدید</button><button class="s d" id="b3">ساخت دوباره کلیدهای کلاینت</button></div>
@@ -6600,7 +6844,7 @@ function renewAdm(id){const a=S.admins.find(x=>x.id==id);
   o=>act(()=>api('/admins/'+id+'/renew','POST',o),'انجام شد'))}
 function delAdm(id,n){if(!confirm(`ادمین ${n} حذف شود؟`))return;const dc=confirm('کلاینت‌های این ادمین هم حذف شوند؟\nتأیید = حذف کلاینت‌ها   |   انصراف = انتقال به مدیر اصلی');act(()=>api('/admins/'+id,'DELETE',{delete_clients:dc}),'حذف شد')}
 /* ---------- تنظیمات ---------- */
-function setHTML(){const s=S.settings,p=S.panel,sv=S.server;return `
+function setHTML(){const s=S.settings,p=S.panel,sv=S.server;setTimeout(remarkPrev,0);return `
 ${p.default_pass?`<div class="card" style="border-inline-start:4px solid var(--bad)"><b>هشدار امنیتی:</b> رمز پیش‌فرض داخل فایل هنوز فعال است. همین حالا از «حساب مدیر» عوضش کن.</div>`:''}
 ${p.restart_needed?`<div class="card" style="border-inline-start:4px solid var(--warn)">تغییر پورت/HTTPS ذخیره شده ولی هنوز اعمال نشده. <button class="p" onclick="restartPanel()">ری‌استارت پنل</button></div>`:''}
 <div class="sgrid"><div class="card"><div class="ch">${ic('globe')}دامنه، پورت و HTTPS پنل</div>
@@ -6624,10 +6868,12 @@ ${p.restart_needed?`<div class="card" style="border-inline-start:4px solid var(-
  <div class="fg"><label>آدرس عمومی پنل برای لینک ساب (اختیاری)</label><input id="s_u" value="${esc(s.public_url)}" placeholder="https://panel.example.com"><small>خالی = از دامنه‌ی بالا یا آدرس فعلی ساخته می‌شود. پشت nginx/کلودفلر پر کن.</small></div>
  <div class="fg"><label>عنوان اشتراک</label><input id="s_t" value="${esc(s.sub_title)}"></div>
  <div class="fg"><label>کانال تلگرام (نمایش در صفحهٔ ساب؛ اختیاری)</label><input id="s_tg" dir="ltr" value="${esc(s.sub_telegram||'')}" placeholder="sepiamDigee"></div>
- <div class="fg"><label>بازه آپدیت خودکار در اپ کلاینت (ساعت)</label><input id="s_i" type="number" value="${s.update_interval}"></div>
+ <div class="fg"><label>بازه آپدیت خودکار در اپ کلاینت (ساعت)</label><input id="s_i" type="number" value="${s.update_interval}"><small>نام داینامیک فقط وقتی تازه می‌شود که اپ کلاینت اشتراک را آپدیت کند؛ برای اعداد دقیق‌تر این را کم کن (مثلاً ۱ تا ۳).</small></div>
+ <div class="fg"><label>قالب نام کانفیگ‌ها (نام داینامیک)</label><input id="s_r" dir="auto" value="${esc(s.sub_remark)}" oninput="remarkPrev()"><small>متغیرها: <code>{status}</code> (🟢 عادی / 🟡 رو به اتمام / 🔴 غیرفعال) · <code>{state}</code> · <code>{name}</code> · <code>{inbound}</code> · <code>{remark}</code> · <code>{left}</code> (حجم باقی‌مانده) · <code>{used}</code> · <code>{limit}</code> · <code>{days}</code> (روز باقی‌مانده). خالی = نام ساده.</small><div class="mut sm" id="s_rp" style="margin-top:4px"></div></div>
  <button class="p" onclick="saveSet()">${ic('save')}ذخیره تغییرات</button></div>
 <div class="card"><div class="ch">${ic('info')}اطلاعات سرور</div><div class="meta"><span>WireGuard: <b>${esc(sv.wg||'نصب نیست')}</b></span><span>AmneziaWG: <b>${esc(sv.awg||'نصب نیست')}</b></span><span>اینترفیس خروجی: <b>${esc(sv.nat_iface)}</b></span><span>QR: <b>${sv.qr?'فعال':'نصب نیست'}</b></span><span>HTTPS: <b>${p.tls_on?'فعال':'خاموش'}</b></span></div></div></div>`}
-function saveSet(){act(()=>api('/settings','PUT',{public_url:$('#s_u').value,sub_title:$('#s_t').value,sub_telegram:$('#s_tg').value,update_interval:$('#s_i').value}),'ذخیره شد')}
+function remarkPrev(){const e=$('#s_r'),o=$('#s_rp');if(!e||!o)return;const v={status:'🟢',state:'فعال',name:'ali',inbound:'آلمان',remark:'آلمان',left:'12.3 GB',used:'7.7 GB',limit:'20 GB',days:'20 روز'};o.textContent=e.value?'پیش‌نمایش: '+e.value.replace(/\{(\w+)\}/g,(m,k)=>v[k]??m):'پیش‌نمایش: ali-نام‌اینباند'}
+function saveSet(){act(()=>api('/settings','PUT',{public_url:$('#s_u').value,sub_title:$('#s_t').value,sub_telegram:$('#s_tg').value,update_interval:$('#s_i').value,sub_remark:$('#s_r').value}),'ذخیره شد')}
 function savePanel(){act(()=>api('/panel','PUT',{domain:$('#p_dom').value,port:$('#p_port').value,path:$('#p_path').value,cert:$('#p_cert').value,key:$('#p_key').value,allowed_ips:$('#p_allow').value}),'ذخیره شد')}
 async function restartPanel(){if(!confirm('پنل ری‌استارت می‌شود و به آدرس جدید می‌روید. ادامه؟'))return;try{const r=await api('/panel/restart','POST');toast('در حال ری‌استارت…');setTimeout(()=>{location.href=r.url},3500)}catch(e){toast(e.message,1)}}
 function issueCert(){toast('در حال گرفتن گواهی… (تا ۲ دقیقه)');act(()=>api('/panel/cert','POST',{domain:$('#p_dom').value,email:$('#p_mail').value}),'گواهی ساخته شد؛ پنل را ری‌استارت کنید')}
