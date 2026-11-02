@@ -4,7 +4,7 @@
 # آپدیت:  همان دستور بالا را دوباره اجرا کنید (دیتابیس و رمز حفظ می‌شود)
 # حذف:    sepipanel uninstall   (یا: bash <(curl -fsSL .../install.sh) uninstall)
 # منو:    sepipanel
-# متغیرها: PORT=8080  AWG=1 (نصب AmneziaWG)  XRAY=1 (نصب Xray-core برای VLESS / Shadowsocks / Trojan؛ وگرنه موقع ساخت اینباند خودکار دانلود می‌شود)  OVPN=1 (نصب OpenVPN؛ وگرنه موقع ساخت اینباند خودکار نصب می‌شود)  L2TP=1 (نصب xl2tpd+strongSwan؛ وگرنه موقع ساخت اینباند L2TP خودکار نصب می‌شود)  BRANCH=main
+# متغیرها: PORT=8080  AWG=1 (نصب AmneziaWG)  XRAY=1 (نصب Xray-core برای VLESS / Shadowsocks / Trojan؛ وگرنه موقع ساخت اینباند خودکار دانلود می‌شود)  OVPN=1 (نصب OpenVPN؛ وگرنه موقع ساخت اینباند خودکار نصب می‌شود)  TOR=1 (نصب Tor برای لوکیشن‌های Tor؛ وگرنه موقع ساخت اولین لوکیشن خودکار نصب می‌شود)  L2TP=1 (نصب xl2tpd+strongSwan؛ وگرنه موقع ساخت اینباند L2TP خودکار نصب می‌شود)  BRANCH=main
 set -euo pipefail
 
 # ====== اینجا را با ریپوی خودتان عوض کنید ======
@@ -56,6 +56,12 @@ fi
 if [ "${OVPN:-0}" = "1" ]; then
   echo ">> نصب OpenVPN..."
   apt-get install -y openvpn openssl || echo "نصب openvpn ناموفق بود؛ ادامه بدون آن"
+fi
+
+if [ "${TOR:-0}" = "1" ]; then
+  echo ">> نصب Tor (برای لوکیشن‌های Tor)..."
+  apt-get install -y tor tor-geoipdb obfs4proxy || apt-get install -y tor tor-geoipdb || echo "نصب Tor ناموفق بود؛ هنگام ساخت اولین لوکیشن Tor دوباره تلاش می‌شود"
+  systemctl disable --now tor tor@default 2>/dev/null || true
 fi
 
 if [ "${XRAY:-0}" = "1" ] && [ ! -x /usr/local/bin/xray ]; then

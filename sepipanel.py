@@ -38,7 +38,7 @@ AWG_DIR        = "/etc/amnezia/amneziawg"   # اینباندهای AmneziaWG
 DB_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sepipanel.db")
 STATS_INTERVAL = 15                      # ثانیه
 PUBLIC_URL     = ""                      # مثلا https://panel.example.com ؛ خالی = خودکار
-PANEL_VERSION  = "1.0.0"                 # با هر ریلیز جدید در گیت‌هاب این عدد را بالا ببرید (و تگ ریلیز را v1.0.1 بزنید)
+PANEL_VERSION  = "1.1.0"                 # با هر ریلیز جدید در گیت‌هاب این عدد را بالا ببرید (و تگ ریلیز را v1.0.1 بزنید)
 DEFAULT_REPO   = "iwasSepi/sepipanel"
 # ==========================================================================
 
@@ -930,7 +930,7 @@ def link_remark(c, ci, ib):
     left_b = max(0, lim - used) if lim else None
     low = (lim and left_b <= lim * 0.1) or (d is not None and 0 < d <= 3)
     vals = dict(status="🔴" if st != "active" else "🟡" if low else "🟢", state=STATE_FA.get(st, st),
-                name=c["name"], inbound=ib["name"], remark=ib["remark"] or ib["name"],
+                name=c["name"], inbound=(ib["remark"] if ib["remark"] and tor_is_exit(ib) else ib["name"]), remark=ib["remark"] or ib["name"],
                 left="∞" if left_b is None else fmt_b(left_b), used=fmt_b(used), limit="∞" if not lim else fmt_b(lim),
                 days="∞" if d is None else (f"{d} روز" if d > 0 else "منقضی"))
     out = oneline(re.sub(r"\{(\w+)\}", lambda m: str(vals.get(m.group(1), m.group(0))), tpl))[:120]
@@ -967,7 +967,7 @@ XRAY_DEFAULT = dict(listen="0.0.0.0", transport="tcp", security="reality", flow=
                     multi_mode=0, xhttp_mode="auto", tcp_header="none", kcp_header="none", kcp_seed="",
                     fallback_dest="", fallback_xver=0, sniffing=1, route_only=0, block_bt=0, block_private=0,
                     domain_strategy="AsIs", tfo=0, extra_stream="", custom_sub=0,
-                    ss_method="2022-blake3-aes-128-gcm", ss_network="tcp,udp")
+                    ss_method="2022-blake3-aes-128-gcm", ss_network="tcp,udp", exit="")
 PRIVATE_CIDRS = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24",
                  "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4", "::1/128", "fc00::/7", "fe80::/10"]
 
@@ -1201,6 +1201,8 @@ def parse_vless(d, cur=None, proto="vless"):
     pp = num(setting("panel_port"), PANEL_PORT, 1, 65535, "پورت پنل")
     if net == "tcp" and port == pp and not nid:
         raise Err("این پورت را خود پنل استفاده می‌کند")
+    if tor_port_clash(port, nid):
+        raise Err("این پورت برای Tor (فقط لوکال) رزرو شده؛ پورت دیگری انتخاب کنید")
     for r in q("SELECT * FROM inbounds WHERE id!=? AND port=? AND COALESCE(node_id,0)=?", (cid, port, nid)):
         if net in ib_nets(r):
             raise Err(f"پورت {port}/{net} برای اینباند «{r['name']}» استفاده شده")
@@ -1318,6 +1320,7 @@ def parse_vless(d, cur=None, proto="vless"):
     o["domain_strategy"] = strv("domain_strategy") or "AsIs"
     if o["domain_strategy"] not in ("AsIs", "UseIP", "UseIPv4", "UseIPv6"):
         raise Err("domainStrategy نامعتبر است")
+    _parse_exit(o, strv, nid)
     ex = str(g("extra_stream") or "").strip()
     if ex:
         try:
@@ -1376,6 +1379,8 @@ def parse_ss(d, cur=None):
     nets = o["ss_network"].split(",")
     if "tcp" in nets and port == pp and not nid:
         raise Err("این پورت را خود پنل استفاده می‌کند")
+    if tor_port_clash(port, nid):
+        raise Err("این پورت برای Tor (فقط لوکال) رزرو شده؛ پورت دیگری انتخاب کنید")
     for r in q("SELECT * FROM inbounds WHERE id!=? AND port=? AND COALESCE(node_id,0)=?", (cid, port, nid)):
         for net in nets:
             if net in ib_nets(r):
@@ -1394,6 +1399,7 @@ def parse_ss(d, cur=None):
     o["domain_strategy"] = strv("domain_strategy") or "AsIs"
     if o["domain_strategy"] not in ("AsIs", "UseIP", "UseIPv4", "UseIPv6"):
         raise Err("domainStrategy نامعتبر است")
+    _parse_exit(o, strv, nid)
     pki = pki_of(cur) if cur else {}
     n_key = SS_METHODS[o["ss_method"]]
     if n_key:           # Shadowsocks 2022: کلید سرور (هر کلاینت کلید خودش را دارد)
@@ -1423,6 +1429,551 @@ def _deep_merge(a, b):
         else:
             a[k] = v
     return a
+
+
+# ------------------------------ Tor (چند لوکیشن روی همین سرور، بدون سرور دوم) ------------------------------
+# هر کشور = یک نمونهٔ Tor جدا (سرویس sepipanel-tor@<cc>) با ExitNodes {cc} و StrictNodes
+# اینباندهای Xray می‌توانند «خروجی Tor (کشور ...)» داشته باشند: ترافیک کاربر ← Xray ← SOCKS محلی Tor ← خروج از آن کشور
+TOR_DIR = "/etc/tor/sepipanel"          # داخل مسیرهای مجاز AppArmor خود Tor (/etc/tor و /var/lib/tor)
+TOR_DATA = "/var/lib/tor/sepipanel"
+TOR_UNIT = "/etc/systemd/system/sepipanel-tor@.service"
+TOR_PORT0 = 20000                 # پورت SOCKS هر کشور: 20000 + 2*شمارهٔ کشور (فقط روی 127.0.0.1)؛ پورت بعدی هم رزرو است
+TOR_DOH = "https://1.1.1.1/dns-query"      # DNS کاربران از مسیر Tor و با DoH (روی 443 همیشه از خروجی‌ها عبور می‌کند)
+TOR_LOCK = threading.RLock()
+TOR_JOBS = collections.OrderedDict()
+TOR_SCAN = {"state": "idle", "ts": 0, "err": "", "data": []}
+TOR_COUNTRIES = [
+    ("de", "آلمان"), ("nl", "هلند"), ("fr", "فرانسه"), ("us", "آمریکا"), ("gb", "انگلستان"), ("se", "سوئد"),
+    ("ch", "سوئیس"), ("at", "اتریش"), ("ca", "کانادا"), ("fi", "فنلاند"), ("no", "نروژ"), ("dk", "دانمارک"),
+    ("ro", "رومانی"), ("pl", "لهستان"), ("cz", "چک"), ("lu", "لوکزامبورگ"), ("ua", "اوکراین"), ("is", "ایسلند"),
+    ("ie", "ایرلند"), ("es", "اسپانیا"), ("it", "ایتالیا"), ("be", "بلژیک"), ("pt", "پرتغال"), ("bg", "بلغارستان"),
+    ("md", "مولداوی"), ("rs", "صربستان"), ("ee", "استونی"), ("lv", "لتونی"), ("lt", "لیتوانی"), ("hu", "مجارستان"),
+    ("sk", "اسلواکی"), ("si", "اسلوونی"), ("hr", "کرواسی"), ("gr", "یونان"), ("al", "آلبانی"), ("ru", "روسیه"),
+    ("tr", "ترکیه"), ("by", "بلاروس"), ("il", "اسرائیل"), ("ae", "امارات"), ("jp", "ژاپن"), ("sg", "سنگاپور"),
+    ("hk", "هنگ‌کنگ"), ("kr", "کره جنوبی"), ("tw", "تایوان"), ("in", "هند"), ("th", "تایلند"), ("my", "مالزی"),
+    ("id", "اندونزی"), ("au", "استرالیا"), ("nz", "نیوزیلند"), ("br", "برزیل"), ("ar", "آرژانتین"), ("cl", "شیلی"),
+    ("mx", "مکزیک"), ("za", "آفریقای جنوبی"),
+]
+_TOR_NAMES = dict(TOR_COUNTRIES)
+_db.execute("CREATE TABLE IF NOT EXISTS tor_locs(cc TEXT PRIMARY KEY, port INTEGER NOT NULL, pinned INTEGER DEFAULT 0, created INTEGER)")
+
+
+def tor_cc_ok(cc):
+    return bool(re.fullmatch(r"[a-z]{2}", str(cc or "")))
+
+
+def tor_flag(cc):
+    return "".join(chr(0x1F1E6 + ord(c) - 97) for c in cc) if tor_cc_ok(cc) else ""
+
+
+def tor_name(cc):
+    return _TOR_NAMES.get(cc, cc.upper())
+
+
+def tor_exit_of(o):
+    """کد کشورِ خروجی Tor یک xcfg (یا '' اگر خروجی مستقیم است)"""
+    m = re.fullmatch(r"tor:([a-z]{2})", str((o or {}).get("exit") or ""))
+    return m.group(1) if m else ""
+
+
+def tor_is_exit(ib):
+    return is_vless(ib) and bool(tor_exit_of(xcfg_of(ib)))
+
+
+def _parse_exit(o, strv, nid):
+    """فیلد «خروجی» اینباند Xray: '' = مستقیم، 'tor:de' = از طریق Tor با خروج از آلمان"""
+    ex = strv("exit")
+    o["exit"] = ""
+    if not ex:
+        return
+    if not re.fullmatch(r"tor:[a-z]{2}", ex):
+        raise Err("خروجی نامعتبر است")
+    if nid:
+        raise Err("خروجی Tor فعلاً فقط برای اینباندهای «این سرور» کار می‌کند، نه روی نودها")
+    o["exit"] = ex
+    o["sniffing"], o["route_only"], o["block_bt"] = 1, 0, 1      # نام دامنه باید به Tor برسد؛ BitTorrent روی Tor ممنوع (به شبکه آسیب می‌زند)
+
+
+def tor_row(cc):
+    return q("SELECT * FROM tor_locs WHERE cc=?", (cc,), True)
+
+
+def tor_ports(cc):
+    r = tor_row(cc)
+    p = r["port"] if r else TOR_PORT0 + ((ord(cc[0]) - 97) * 26 + (ord(cc[1]) - 97)) * 2
+    return p, p + 1
+
+
+def tor_port_clash(port, nid=0):
+    """پورت‌های محلی Tor را اینباند جدید نباید بگیرد"""
+    if nid:
+        return False
+    return any(port in (r["port"], r["port"] + 1) for r in q("SELECT port FROM tor_locs"))
+
+
+def _bindable(p):
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        s_ = socket.socket(socket.AF_INET, kind)
+        try:
+            s_.bind(("127.0.0.1", p))
+        except OSError:
+            return False
+        finally:
+            s_.close()
+    return True
+
+
+def tor_alloc_port(cc):
+    used = {r["port"] for r in q("SELECT port FROM inbounds")}
+    used.add(num(setting("panel_port"), PANEL_PORT, 1, 65535, "پورت پنل"))
+    for r in q("SELECT port FROM tor_locs"):
+        used |= {r["port"], r["port"] + 1}
+    p = tor_ports(cc)[0]
+    for _ in range(3000):
+        if p not in used and p + 1 not in used and _bindable(p) and _bindable(p + 1):
+            return p
+        p += 2
+        if p > 60000:
+            p = 22000
+    raise Err("پورت آزاد برای Tor پیدا نشد")
+
+
+def tor_bin():
+    return shutil.which("tor")
+
+
+def tor_user():
+    for u in ("debian-tor", "_tor", "tor"):
+        if run(["id", "-u", u], timeout=5)[0] == 0:
+            return u
+    return "root"
+
+
+def ensure_tor():
+    """نصب Tor (فقط Ubuntu/Debian). برمی‌گرداند: رشتهٔ خطا یا ''"""
+    if tor_bin():
+        return ""
+    if not shutil.which("apt-get"):
+        return "نصب خودکار Tor فقط روی Ubuntu/Debian ممکن است؛ tor و tor-geoipdb را دستی نصب کنید"
+    rc, o, e = run(["bash", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get update -y >/dev/null 2>&1; "
+                    "apt-get install -y tor tor-geoipdb 2>&1 | tail -4"], timeout=480)
+    if not tor_bin():
+        return f"نصب Tor ناموفق بود ({(o or e).strip()[-220:]}). دستی نصب کنید: apt install tor tor-geoipdb"
+    # سرویس پیش‌فرض Tor (SOCKS 9050) لازم نیست و رم می‌خورد
+    run(["systemctl", "disable", "--now", "tor@default"], timeout=40)
+    run(["systemctl", "disable", "--now", "tor"], timeout=40)
+    return ""
+
+
+def tor_obfs4_bin():
+    b = shutil.which("obfs4proxy") or shutil.which("lyrebird")
+    if b:
+        return b
+    run(["bash", "-c", "export DEBIAN_FRONTEND=noninteractive; apt-get install -y obfs4proxy >/dev/null 2>&1 || "
+        "apt-get install -y lyrebird >/dev/null 2>&1"], timeout=240)
+    return shutil.which("obfs4proxy") or shutil.which("lyrebird") or ""
+
+
+_BR_RE = re.compile(r"(obfs4\s+)?(\[[0-9a-fA-F:]+\]|[0-9]{1,3}(\.[0-9]{1,3}){3}):\d{1,5}(\s+[0-9A-Fa-f]{40})?(\s+[A-Za-z0-9_\-]+=[^\s]+)*")
+
+
+def parse_bridges(txt):
+    """فقط bridge ساده و obfs4؛ هر خط یک bridge. (جلوگیری از تزریق دستور داخل torrc)"""
+    out = []
+    for ln in str(txt or "").splitlines():
+        ln = re.sub(r"\s+", " ", ln.strip())
+        if not ln or ln.startswith("#"):
+            continue
+        if ln.lower().startswith("bridge "):
+            ln = ln[7:].strip()
+        if not _BR_RE.fullmatch(ln) or len(ln) > 400:
+            raise Err(f"Bridge نامعتبر است (فقط obfs4 یا bridge ساده پشتیبانی می‌شود): {ln[:60]}")
+        out.append(ln)
+    if len(out) > 20:
+        raise Err("حداکثر ۲۰ bridge")
+    return out
+
+
+def tor_bridges():
+    try:
+        return parse_bridges(setting("tor_bridges", ""))
+    except Err:
+        return []
+
+
+def tor_torrc(cc, port):
+    L = [f"DataDirectory {TOR_DATA}/{cc}", f"SocksPort 127.0.0.1:{port}",
+         "SocksPolicy accept 127.0.0.1", "SocksPolicy reject *",
+         "ExitNodes {%s}" % cc, "StrictNodes 1", "ClientOnly 1", "AvoidDiskWrites 1",
+         "ConnectionPadding 0", "CircuitPadding 0", "Log notice stdout"]
+    br = tor_bridges()
+    if br:
+        L.append("UseBridges 1")
+        if any(b.lower().startswith("obfs4") for b in br):
+            ob = tor_obfs4_bin()
+            if not ob:
+                raise Err("برای bridge از نوع obfs4 باید obfs4proxy (یا lyrebird) نصب باشد: apt install obfs4proxy")
+            L.append(f"ClientTransportPlugin obfs4 exec {ob}")
+        L += [f"Bridge {b}" for b in br]
+    return "\n".join(L) + "\n"
+
+
+def tor_unit_text(user, b):
+    return f"""[Unit]
+Description=SepiPanel Tor (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User={user}
+ExecStart={b} -f {TOR_DIR}/%i/torrc
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def tor_unit(cc):
+    return f"sepipanel-tor@{cc}"
+
+
+def tor_active(cc):
+    return run(["systemctl", "is-active", "--quiet", tor_unit(cc)], timeout=8)[0] == 0
+
+
+def tor_boot(cc):
+    """درصد Bootstrap از لاگ سرویس (۱۰۰ = آماده)"""
+    rc, out, _ = run(["journalctl", "-u", tor_unit(cc), "-n", "300", "--no-pager", "-o", "cat"], timeout=10)
+    m = re.findall(r"Bootstrapped (\d+)%", out or "")
+    return int(m[-1]) if m else 0
+
+
+def tor_ensure(cc, pinned=False):
+    """لوکیشن Tor این کشور را نصب/ساخت/اجرا می‌کند. برمی‌گرداند: رشتهٔ خطا یا ''"""
+    if not tor_cc_ok(cc):
+        return "کد کشور نامعتبر است"
+    with TOR_LOCK:
+        e = ensure_tor()
+        if e:
+            return e
+        try:
+            r = tor_row(cc)
+            if not r:
+                x("INSERT INTO tor_locs(cc,port,pinned,created) VALUES(?,?,?,?)", (cc, tor_alloc_port(cc), 1 if pinned else 0, now()))
+                r = tor_row(cc)
+            elif pinned and not r["pinned"]:
+                x("UPDATE tor_locs SET pinned=1 WHERE cc=?", (cc,))
+            user, port = tor_user(), r["port"]
+            torrc = tor_torrc(cc, port)
+        except Err as ex:
+            return str(ex)
+        dd = f"{TOR_DATA}/{cc}"
+        os.makedirs(TOR_DATA, exist_ok=True)
+        os.makedirs(dd, exist_ok=True)
+        os.chmod(dd, 0o700)
+        try:
+            shutil.chown(dd, user=user)
+        except Exception:
+            pass
+        changed = write_file(f"{TOR_DIR}/{cc}/torrc", torrc, 0o644, backup=False)
+        for d_ in (TOR_DIR, f"{TOR_DIR}/{cc}"):      # کاربر tor باید بتواند torrc را بخواند
+            try:
+                os.chmod(d_, 0o755)
+            except OSError:
+                pass
+        u_changed = write_file(TOR_UNIT, tor_unit_text(user, tor_bin()), 0o644, backup=False)
+        if u_changed:
+            run(["systemctl", "daemon-reload"], timeout=20)
+        unit = tor_unit(cc)
+        if changed or u_changed or not tor_active(cc):
+            run(["systemctl", "enable", unit], timeout=20)
+            rc, _, err = run(["systemctl", "restart", unit], timeout=40)
+            if rc != 0:
+                return f"Tor ({tor_name(cc)}) اجرا نشد — {err.strip()[-200:]} (journalctl -u {unit} -e)"
+    return ""
+
+
+def tor_users(cc):
+    return [r["name"] for r in q("SELECT * FROM inbounds WHERE proto IN ('vless','ss','trojan') ORDER BY id")
+            if tor_exit_of(xcfg_of(r)) == cc]
+
+
+def tor_remove(cc):
+    with TOR_LOCK:
+        run(["systemctl", "disable", "--now", tor_unit(cc)], timeout=40)
+        shutil.rmtree(f"{TOR_DIR}/{cc}", ignore_errors=True)
+        shutil.rmtree(f"{TOR_DATA}/{cc}", ignore_errors=True)
+        x("DELETE FROM tor_locs WHERE cc=?", (cc,))
+
+
+def tor_gc():
+    """لوکیشن‌هایی که نه اینباندی از آن‌ها استفاده می‌کند و نه دستی فعال شده‌اند، پاک می‌شوند (آزاد شدن رم)"""
+    with TOR_LOCK:
+        for r in q("SELECT * FROM tor_locs WHERE pinned=0"):
+            if not tor_users(r["cc"]):
+                tor_remove(r["cc"])
+
+
+def tor_gc_safe():
+    try:
+        tor_gc()
+    except Exception:
+        log.exception("tor_gc")
+
+
+def _recvn(s, n):
+    b = b""
+    while len(b) < n:
+        c = s.recv(n - len(b))
+        if not c:
+            raise Err("اتصال SOCKS بسته شد")
+        b += c
+    return b
+
+
+def tor_socks_connect(port, host, dport, timeout=30):
+    s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+    try:
+        s.settimeout(timeout)
+        s.sendall(b"\x05\x01\x00")
+        if _recvn(s, 2) != b"\x05\x00":
+            raise Err("پاسخ SOCKS نامعتبر")
+        h = host.encode()
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + dport.to_bytes(2, "big"))
+        hd = _recvn(s, 4)
+        if hd[1] != 0:
+            raise Err({4: "مقصد در دسترس نیست", 5: "اتصال رد شد", 6: "TTL تمام شد"}.get(hd[1], f"خطای SOCKS {hd[1]} (مدار Tor ساخته نشد؟)"))
+        _recvn(s, {1: 4, 4: 16}.get(hd[3], 0) + (_recvn(s, 1)[0] if hd[3] == 3 else 0) + 2)
+        return s
+    except Exception:
+        s.close()
+        raise
+
+
+def tor_probe(port):
+    """پینگ واقعی از مسیر Tor + آی‌پی خروجی"""
+    host, out = "check.torproject.org", {"ok": False}
+    t0 = time.time()
+    try:
+        tor_socks_connect(port, host, 443).close()
+    except Exception as e:
+        out["error"] = str(e)[:160] or "اتصال از مسیر Tor ممکن نشد"
+        return out
+    first, ms = int((time.time() - t0) * 1000), []
+    for _ in range(3):
+        t1 = time.time()
+        try:
+            tor_socks_connect(port, host, 443, 20).close()
+            ms.append(int((time.time() - t1) * 1000))
+        except Exception:
+            pass
+    ip = ""
+    try:
+        s = tor_socks_connect(port, host, 443, 25)
+        ss = ssl.create_default_context().wrap_socket(s, server_hostname=host)
+        ss.sendall(b"GET /api/ip HTTP/1.1\r\nHost: check.torproject.org\r\nConnection: close\r\nUser-Agent: sepipanel\r\n\r\n")
+        data = b""
+        while len(data) < 8192:
+            c = ss.recv(2048)
+            if not c:
+                break
+            data += c
+        ss.close()
+        m = re.search(rb"\{.*\}", data, re.S)
+        j = json.loads(m.group(0)) if m else {}
+        ip = str(j.get("IP") or "")
+        out["is_tor"] = bool(j.get("IsTor"))
+    except Exception:
+        pass
+    ms.sort()
+    out.update(ok=True, first_ms=first, ms=ms[len(ms) // 2] if ms else first, ip=ip)
+    return out
+
+
+def tor_loc_info(r, deep=True):
+    cc = r["cc"]
+    d = dict(cc=cc, name=tor_name(cc), flag=tor_flag(cc), port=r["port"], pinned=r["pinned"], users=tor_users(cc))
+    if deep:
+        d["running"] = tor_active(cc)
+        d["boot"] = tor_boot(cc) if d["running"] else 0
+    return d
+
+
+def tor_brief():
+    return dict(countries=[[c, n, tor_flag(c)] for c, n in TOR_COUNTRIES])
+
+
+# ---- اسکن کشورها: تعداد خروجی‌ها + پینگ تقریبی (TCP از این سرور تا خروجی‌های هر کشور) ----
+ONIONOO = ("https://onionoo.torproject.org/details?type=relay&running=true&flag=Exit"
+           "&fields=country,or_addresses,exit_probability,exit_policy_summary")
+
+
+def _port_in(spec, p):
+    for it in spec or []:
+        a, _, b = str(it).partition("-")
+        try:
+            if int(a) <= p <= int(b or a):
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _exit_allows(ps, p):
+    if not isinstance(ps, dict):
+        return True
+    if "accept" in ps:
+        return _port_in(ps["accept"], p)
+    if "reject" in ps:
+        return not _port_in(ps["reject"], p)
+    return True
+
+
+def _tcp_ms(addr, timeout=3.0):
+    host, _, port = addr.rpartition(":")
+    host = host.strip("[]")
+    t0 = time.time()
+    try:
+        socket.create_connection((host, int(port)), timeout=timeout).close()
+    except Exception:
+        return None
+    return int((time.time() - t0) * 1000)
+
+
+def tor_scan_calc(relays):
+    """relays: لیست آبجکت‌های Onionoo ← لیست کشورها با تعداد خروجی، سهم و پینگ تقریبی"""
+    by = {}
+    for r in relays:
+        cc = str(r.get("country") or "").lower()
+        if not tor_cc_ok(cc) or not _exit_allows(r.get("exit_policy_summary"), 443):
+            continue
+        v4 = next((a for a in (r.get("or_addresses") or []) if not str(a).startswith("[")), "")
+        by.setdefault(cc, []).append((float(r.get("exit_probability") or 0), v4))
+    jobs = []
+    for cc, lst in by.items():
+        lst.sort(reverse=True)
+        jobs += [(cc, a) for _, a in [t for t in lst if t[1]][:6]]
+    ping = {}
+    if jobs:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=40) as ex:
+            for (cc, _), ms in zip(jobs, ex.map(lambda j: _tcp_ms(j[1]), jobs)):
+                if ms is not None:
+                    ping.setdefault(cc, []).append(ms)
+    out = []
+    for cc, lst in by.items():
+        pm = sorted(ping.get(cc, []))
+        out.append(dict(cc=cc, name=tor_name(cc), flag=tor_flag(cc), exits=len(lst),
+                        share=round(sum(t[0] for t in lst) * 100, 2), ping=pm[len(pm) // 2] if pm else None))
+    out.sort(key=lambda d: (d["ping"] is None, d["ping"] or 0, -d["exits"]))
+    return out
+
+
+def tor_scan_job():
+    try:
+        req = urllib.request.Request(ONIONOO, headers={"User-Agent": "sepipanel"})
+        with urllib.request.urlopen(req, timeout=45) as r:
+            relays = json.loads(r.read().decode("utf-8", "replace")).get("relays") or []
+        data = tor_scan_calc(relays)
+        TOR_SCAN.update(state="done", ts=now(), err="" if data else "لیست خروجی‌ها خالی بود", data=data)
+        set_setting("tor_scan", json.dumps({"ts": TOR_SCAN["ts"], "data": data}, ensure_ascii=False))
+    except Exception as e:
+        TOR_SCAN.update(state="error", err=f"اتصال به Onionoo ممکن نشد: {str(e)[:120]}")
+
+
+def tor_scan_start():
+    with TOR_LOCK:
+        if TOR_SCAN["state"] == "run":
+            return
+        TOR_SCAN["state"] = "run"
+    threading.Thread(target=tor_scan_job, daemon=True).start()
+
+
+def tor_scan_load():
+    if not TOR_SCAN["data"]:
+        try:
+            j = json.loads(setting("tor_scan", "") or "{}")
+            if j.get("data"):
+                TOR_SCAN.update(ts=j.get("ts", 0), data=j["data"])
+        except Exception:
+            pass
+
+
+def tor_job_start(fn, *a):
+    """کار طولانی (نصب Tor، بالا آمدن، تست) در ترد جدا؛ نتیجه با GET /api/tor/job/<id>"""
+    jid = secrets.token_hex(6)
+    j = {"state": "run", "error": "", "res": None, "msg": ""}
+    TOR_JOBS[jid] = j
+    while len(TOR_JOBS) > 30:
+        TOR_JOBS.popitem(last=False)
+
+    def work():
+        try:
+            j["res"] = fn(j, *a)
+            j["state"] = "done"
+        except Exception as e:
+            j["error"], j["state"] = str(e)[:300], "error"
+    threading.Thread(target=work, daemon=True).start()
+    return jid
+
+
+def _job_enable(j, cc):
+    j["msg"] = "نصب و راه‌اندازی Tor…"
+    e = tor_ensure(cc, pinned=True)
+    if e:
+        raise Err(e)
+    return {}
+
+
+def _job_restart(j, cc):
+    j["msg"] = "ری‌استارت Tor…"
+    if not tor_row(cc):
+        raise Err("این لوکیشن فعال نیست")
+    run(["systemctl", "restart", tor_unit(cc)], timeout=40)
+    return {}
+
+
+def _job_test(j, cc):
+    """تست پینگ واقعی: اگر کشور فعال نبود موقت بالا می‌آید و بعد از تست اگر کسی استفاده نمی‌کرد پاک می‌شود"""
+    j["msg"] = "بالا آوردن Tor…"
+    e = tor_ensure(cc)
+    if e:
+        raise Err(e)
+    try:
+        t_end = time.time() + 120
+        while time.time() < t_end:
+            b = tor_boot(cc)
+            j["msg"] = f"اتصال به شبکه Tor… {b}٪"
+            if b >= 100:
+                break
+            time.sleep(2)
+        else:
+            raise Err("Tor تا ۲ دقیقه آماده نشد (اگر سرور در کشوری است که Tor فیلتر است، در تب Tor «Bridge» اضافه کنید؛ یا آن کشور خروجی کافی ندارد)")
+        j["msg"] = "تست اتصال از مسیر Tor…"
+        res = tor_probe(tor_ports(cc)[0])
+        if not res.get("ok"):
+            raise Err(res.get("error") or "تست ناموفق بود")
+        return res
+    finally:
+        tor_gc()
+
+
+def _job_bridges(j):
+    j["msg"] = "اعمال Bridge روی همهٔ لوکیشن‌ها…"
+    errs = []
+    for r in q("SELECT cc FROM tor_locs"):
+        e = tor_ensure(r["cc"])
+        if e:
+            errs.append(e)
+    if errs:
+        raise Err(" | ".join(errs)[:300])
+    return {}
 
 
 def xray_users(ib):
@@ -1507,14 +2058,27 @@ def xray_build(ib):
         rules.append({"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"})
     if o["block_private"]:
         rules.append({"type": "field", "ip": PRIVATE_CIDRS, "outboundTag": "block"})
-    return {"log": {"loglevel": "warning"}, "stats": {},
+    outbounds = [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": o["domain_strategy"]}},
+                 {"tag": "block", "protocol": "blackhole"}]
+    tcc = tor_exit_of(o)
+    if tcc:
+        sp = tor_ports(tcc)[0]
+        outbounds = [{"tag": "tor", "protocol": "socks", "settings": {"servers": [{"address": "127.0.0.1", "port": sp}]}},
+                     {"tag": "tor-dns", "protocol": "dns"},
+                     {"tag": "block", "protocol": "blackhole"}]
+        rules += [{"type": "field", "inboundTag": [tag], "network": "udp", "port": "53", "outboundTag": "tor-dns"},
+                  {"type": "field", "inboundTag": [tag], "network": "udp", "outboundTag": "block"},
+                  {"type": "field", "inboundTag": [tag], "outboundTag": "tor"}]
+    cfg_ = {"log": {"loglevel": "warning"}, "stats": {},
             "api": {"tag": "api", "services": ["StatsService", "HandlerService", "RoutingService"]},
             "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}}},
             "inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": aport, "protocol": "dokodemo-door",
                           "settings": {"address": "127.0.0.1"}}, inbound],
-            "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": o["domain_strategy"]}},
-                          {"tag": "block", "protocol": "blackhole"}],
+            "outbounds": outbounds,
             "routing": {"domainStrategy": "AsIs", "rules": rules}}
+    if tcc:
+        cfg_["dns"] = {"servers": [TOR_DOH], "queryStrategy": "UseIPv4", "disableFallback": True}
+    return cfg_
 
 
 XP = ("vless", "shadowsocks", "trojan")
@@ -1589,6 +2153,11 @@ def apply_vless(ib, restart=False):
     e = ensure_xray()
     if e:
         return f"{name}: {e}"
+    tcc = tor_exit_of(xcfg_of(ib))
+    if tcc:
+        e = tor_ensure(tcc)
+        if e:
+            return f"{name}: {e}"
     try:
         cfg = xray_build(ib)
     except Exception as ex:
@@ -4793,7 +5362,7 @@ def state_super():
                       update_interval=int(setting("update_interval", "12") or 12)),
         role="super", admins=[ser_admin(a) for a in q("SELECT * FROM admins ORDER BY id DESC")],
         nodes=[ser_node(n) for n in q("SELECT * FROM nodes ORDER BY id")],
-        defaults=inbound_defaults(), panel=panel_info(),
+        defaults=inbound_defaults(), panel=panel_info(), tor=tor_brief(),
         server=dict(wg=(ver.strip() if rc2 == 0 else ""), awg=(aver.strip() if rc3 == 0 else ""), nat_iface=detect_iface(), qr=bool(qrcode),
                     now=now(), base=base_url()))
 
@@ -4819,6 +5388,83 @@ def state_admin():
     return jsonify(role="admin", inbounds=ibs, me=ser_admin(a), settings={}, admins=[],
                    clients=[ser_client(c) for c in q("SELECT * FROM clients WHERE owner_id=? ORDER BY id DESC", (g.aid,))],
                    panel=dict(user=a["username"]), server=dict(qr=bool(qrcode), now=now(), base=base_url()))
+
+
+# ------------------------------ API تب Tor (فقط مدیر اصلی) ------------------------------
+def _tor_cc(cc):
+    cc = str(cc or "").lower()
+    if not tor_cc_ok(cc):
+        raise Err("کد کشور نامعتبر است")
+    return cc
+
+
+@app.get("/api/tor")
+@auth
+def tor_state():
+    tor_scan_load()
+    ver = ""
+    if tor_bin():
+        ver = (run([tor_bin(), "--version"], timeout=6)[1] or "").splitlines()[0:1]
+        ver = ver[0] if ver else ""
+    return jsonify(installed=bool(tor_bin()), version=ver, bridges=setting("tor_bridges", ""),
+                   locs=[tor_loc_info(r) for r in q("SELECT * FROM tor_locs ORDER BY cc")],
+                   scan=dict(state=TOR_SCAN["state"], ts=TOR_SCAN["ts"], err=TOR_SCAN["err"], data=TOR_SCAN["data"]),
+                   countries=tor_brief()["countries"], now=now(), mem_mb=80)
+
+
+@app.post("/api/tor/scan")
+@auth
+def tor_scan_api():
+    tor_scan_start()
+    return jsonify(ok=True)
+
+
+@app.get("/api/tor/job/<jid>")
+@auth
+def tor_job_state(jid):
+    j = TOR_JOBS.get(jid)
+    if not j:
+        raise Err("کار پیدا نشد")
+    return jsonify(state=j["state"], error=j["error"], res=j["res"], msg=j["msg"])
+
+
+@app.post("/api/tor/<cc>/enable")
+@auth
+def tor_enable(cc):
+    return jsonify(ok=True, job=tor_job_start(_job_enable, _tor_cc(cc)))
+
+
+@app.post("/api/tor/<cc>/restart")
+@auth
+def tor_restart(cc):
+    return jsonify(ok=True, job=tor_job_start(_job_restart, _tor_cc(cc)))
+
+
+@app.post("/api/tor/<cc>/test")
+@auth
+def tor_test(cc):
+    return jsonify(ok=True, job=tor_job_start(_job_test, _tor_cc(cc)))
+
+
+@app.delete("/api/tor/<cc>")
+@auth
+def tor_delete(cc):
+    cc = _tor_cc(cc)
+    if not tor_row(cc):
+        raise Err("این لوکیشن فعال نیست")
+    us = tor_users(cc)
+    if us:
+        raise Err(f"این لوکیشن توسط اینباند {', '.join(us)} استفاده می‌شود؛ اول اینباند را حذف کنید یا خروجی‌اش را عوض کنید")
+    tor_remove(cc)
+    return jsonify(ok=True)
+
+
+@app.put("/api/tor/bridges")
+@auth
+def tor_bridges_save():
+    br = parse_bridges(body().get("bridges"))
+    set_setting("tor_bridges", "\n".join(br))
+    return jsonify(ok=True, job=tor_job_start(_job_bridges), count=len(br))
 
 
 @app.post("/api/update/check")
@@ -5001,7 +5647,9 @@ def inbound_update(iid):
     if is_ovpn(cur) and body().get("regen_keys"):      # CA جدید → همه‌ی گواهی‌های کلاینت‌ها دوباره ساخته شود
         x("UPDATE client_inbound SET ovpn_cn='', ovpn_crt='', ovpn_key='' WHERE inbound_id=?", (iid,))
     sync_inbound_clients(iid)
-    return jsonify(ok=True, warn=apply_inbound(iid, restart=True))
+    w = apply_inbound(iid, restart=True)
+    tor_gc_safe()
+    return jsonify(ok=True, warn=w)
 
 
 @app.delete("/api/inbounds/<int:iid>")
@@ -5010,6 +5658,7 @@ def inbound_delete(iid):
     cur = q("SELECT * FROM inbounds WHERE id=?", (iid,), True) or abort(404)
     teardown(cur)
     x("DELETE FROM inbounds WHERE id=?", (iid,))
+    tor_gc_safe()
     return jsonify(ok=True)
 
 
@@ -6375,6 +7024,7 @@ const IC={
  save:'<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/>',
  user:'<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
  admin:'<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><circle cx="12" cy="10" r="2.2"/><path d="M8.2 16.2c.8-1.6 2.1-2.2 3.8-2.2s3 .6 3.8 2.2"/>'};
+IC.tor='<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5.5"/><circle cx="12" cy="12" r="2"/>';
 const ic=n=>`<svg class="ic" viewBox="0 0 24 24" aria-hidden="true">${IC[n]||''}</svg>`;
 function showLogin(){staStop();$('#app').innerHTML=`<div class="login"><div class="lg2">${ic('shield')}</div><h1>ورود به SepiPanel</h1><div class="fg"><label>نام کاربری</label><input id="lu" autocomplete="username"></div>
 <div class="fg"><label>رمز عبور</label><input id="lp" type="password" autocomplete="current-password"></div><button class="p" onclick="doLogin()">ورود</button></div>`;
@@ -6384,6 +7034,7 @@ async function load(){try{S=await api('/state');S.local=Date.now()/1000;render()
 const STL={active:['فعال','ok'],disabled:['غیرفعال',''],expired:['منقضی','bad'],limit:['اتمام حجم','bad'],admin:['غیرفعال (ادمین)','bad'],key:['غیرفعال (سقف کلید)','bad']};
 const NAV=[['sta','وضعیت','pulse','وضعیت لحظه‌ای سرور و وایرگارد: CPU، رم، دیسک، سرعت شبکه و اتصال‌ها.'],['cli','کلاینت‌ها','users','هر کلاینت می‌تواند عضو چند اینباند باشد.'],['inb','اینباندها','layers','هر اینباند یک اینترفیس وایرگارد است.'],['nod','نودها','server','نود = سرور جداگانه با لوکیشن خودش. اینباندهای VLESS روی هر نود ساخته می‌شوند و همه در یک لینک ساب جمع می‌شوند.'],['adm','ادمین‌ها','admin','ادمین‌ها فقط کلاینت می‌سازند و کلاینت‌های خودشان را مدیریت می‌کنند؛ برای هرکدام حجم و زمان تعیین کنید.'],['set','تنظیمات','settings','دامنه، پورت، حساب مدیر و تنظیمات اشتراک پنل را از اینجا مدیریت کنید.']];
 NAV.push(['tun','تانل','tun','ساخت و مدیریت تانل BackPack بین سرور ایران و خارج؛ هر سمت می‌تواند همین سرور، یکی از نودها یا سرور دیگری با SSH باشد.']);
+NAV.push(['tor','Tor','tor','لوکیشن‌های Tor روی همین سرور (بدون سرور دوم): کشور را انتخاب کنید، پینگ‌ها را ببینید و با یک کلیک اینباند آن کشور را بسازید.']);
 NAV.push(['api','API و مستندات','api','اتصال پنل به ربات تلگرام یا سایت برای فروش خودکار: کلید API بسازید و طبق مستندات زیر کلاینت بسازید، تمدید کنید و لینک اشتراک را تحویل بدهید.']);
 const NAV_A=[['cli','کلاینت‌ها','users','کلاینت‌های خودتان را اینجا بسازید و مدیریت کنید.'],['api','API و مستندات','api','کلید API خودتان را بسازید، سقف حجم و زمانش را کم و زیاد کنید و ربات یا سایتتان را وصل کنید؛ مصرف فقط از کلاینت‌هایی که با همان کلید ساخته می‌شوند کم می‌شود.']];
 const isA=()=>S&&S.role==='admin';
@@ -6411,7 +7062,7 @@ function render(){
  <div class="st"><span class="si p">${ic('users')}</span><span class="l">کلاینت‌ها</span><b>${S.clients.length}</b></div>
  <div class="st"><span class="si bl">${ic('pulse')}</span><span class="l">آنلاین</span><b>${on}</b></div>
  <div class="st"><span class="si o">${ic('db')}</span><span class="l">مصرف کل</span><b>${fmtB(tot)}</b></div></div>
- ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():TAB=='api'?apiHTML():TAB=='tun'?tunHTML():TAB=='nod'?nodHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
+ ${TAB=='inb'?inbHTML():TAB=='cli'?cliHTML():TAB=='adm'?admHTML():TAB=='sta'?staHTML():TAB=='api'?apiHTML():TAB=='tun'?tunHTML():TAB=='nod'?nodHTML():TAB=='tor'?torHTML():setHTML()}</div></div></div>`;if(TAB==='sta')staStart();else staStop()}
 async function logout(){await api('/logout','POST');showLogin()}
 /* ---------- API و مستندات ---------- */
 let APK=null,APD=null;
@@ -6447,6 +7098,75 @@ function apiEdit(id){const k=APK.keys.find(x=>x.id==id);if(!k)return;
   try{const r=await api('/apikeys/'+id,'PUT',b);toast(r.warn||'ذخیره شد',!!r.warn);m.remove();apiLoad()}catch(e){toast(e.message,1)}}}
 async function apiTog(id){try{await api('/apikeys/'+id+'/toggle','POST');apiLoad()}catch(e){toast(e.message,1)}}
 async function apiDel(id){if(!confirm('این کلید حذف شود؟ هر ربات یا سایتی که از آن استفاده می‌کند از کار می‌افتد؛ کلاینت‌های ساخته‌شده می‌مانند.'))return;try{await api('/apikeys/'+id,'DELETE');apiLoad()}catch(e){toast(e.message,1)}}
+/* ---------- Tor (لوکیشن‌های Tor روی همین سرور) ---------- */
+let TOR=null,TORT=null,TORQ='',TORAUTO=false;const TORBUSY={},TORMSG={},TORTEST={};
+const torC=()=>(S&&S.tor&&S.tor.countries)||[];
+const torDt=t=>t?new Date(t*1000).toLocaleString('fa-IR'):'—';
+function torHTML(){setTimeout(torLoad,0);
+ return `<div class="bar2"><span class="mut sm">هر کشور یک «لوکیشن» است که روی همین سرور با Tor ساخته می‌شود (بدون سرور دوم). یک کشور را انتخاب کنید و «ساخت لوکیشن» را بزنید؛ بقیه‌اش خودکار است. توجه: فقط TCP کار می‌کند (UDP/QUIC بلاک می‌شود)، سرعت کمتر و پینگ بیشتر از اتصال مستقیم است.</span>
+ <div class="acts"><button class="s" onclick="torBridgeModal()">Bridge</button><button class="p" onclick="torScan()">اسکن کشورها و پینگ</button></div></div>
+ <div class="bar2"><input id="tq" class="fsel srch" type="search" dir="auto" placeholder="جستجوی کشور…" value="${esc(TORQ)}" oninput="TORQ=this.value;torPaint()" autocomplete="off"><span class="mut sm" id="torInfo"></span></div>
+ <div id="torBox">${torBody()}</div>`}
+async function torLoad(){clearTimeout(TORT);if(TAB!=='tor')return;
+ try{TOR=await api('/tor')}catch(e){if(e.message!=='نیاز به ورود')toast(e.message,1);TORT=setTimeout(torLoad,8000);return}
+ if(!TORAUTO&&TOR.scan.state==='idle'&&!(TOR.scan.data||[]).length){TORAUTO=true;try{await api('/tor/scan','POST');TOR.scan.state='run'}catch(e){}}
+ torPaint();
+ const boot=TOR.locs.some(l=>l.running&&l.boot<100);
+ TORT=setTimeout(torLoad,TOR.scan.state==='run'?2000:boot?4000:15000)}
+function torPaint(){const b=$('#torBox');if(b)b.innerHTML=torBody();const i=$('#torInfo');if(i&&TOR){
+ const s=TOR.scan;i.textContent=s.state==='run'?'در حال اسکن خروجی‌های Tor و اندازه‌گیری پینگ…':s.err?s.err:s.ts?'آخرین اسکن: '+torDt(s.ts):'';
+ i.style.color=s.err&&s.state!=='run'?'#f87171':''}}
+function torRows(){
+ const loc={};(TOR.locs||[]).forEach(l=>loc[l.cc]=l);
+ let base=(TOR.scan.data||[]).map(d=>({...d}));
+ if(!base.length)base=torC().map(([cc,name,flag])=>({cc,name,flag,exits:null,share:null,ping:null}));
+ const have=new Set(base.map(d=>d.cc));
+ (TOR.locs||[]).forEach(l=>{if(!have.has(l.cc))base.push({cc:l.cc,name:l.name,flag:l.flag,exits:null,share:null,ping:null})});
+ base.forEach(d=>d.loc=loc[d.cc]);
+ const k=TORQ.trim().toLowerCase();
+ base=base.filter(d=>!k||(d.name+' '+d.cc).toLowerCase().includes(k));
+ const live=d=>d.loc&&d.loc.running?0:d.loc?1:2;
+ base.sort((a,b)=>live(a)-live(b)||(a.ping==null)-(b.ping==null)||(a.ping||0)-(b.ping||0));
+ return base}
+function torRow(c){
+ const L=c.loc,t=TORTEST[c.cc],busy=TORBUSY[c.cc],pg=c.ping,pct=pg==null?0:Math.max(8,Math.min(100,100-pg*0.4));
+ const real=t&&t.ms?`<small>پینگ واقعی از مسیر Tor: <b>${t.ms}ms</b>${t.ip?` · آی‌پی خروجی: <b dir="ltr">${esc(t.ip)}</b>`:''}</small>`:'';
+ const st=busy?['در حال کار…','warn']:!L?['فعال نیست','']:!L.running?['خاموش','bad']:L.boot>=100?['آماده','ok']:['اتصال '+L.boot+'٪','warn'];
+ const tg=(c.exits!=null&&c.exits<3?'<span class="tag" title="خروجی کم؛ ممکن است ناپایدار باشد">خروجی کم</span>':'')+((L&&L.users)||[]).map(u=>`<span class="tag">${esc(u)}</span>`).join('');
+ return `<div class="cr2 ${L&&L.running?'on':''}"><div class="c1"><b><span class="nm">${c.flag} ${esc(c.name)}</span></b><small dir="ltr">${esc(c.cc.toUpperCase())}${c.exits!=null?` · ${c.exits} خروجی · سهم ${c.share}٪`:''}</small><div class="tg">${tg}</div></div>
+ <div class="c2"><div class="pg"><i style="width:${pct}%"></i></div><small>${pg==null?'پینگ تقریبی: نامشخص':'پینگ تقریبی تا خروجی‌ها: '+pg+'ms'}</small>${real}</div>
+ <div class="c3"><span class="b ${st[1]}">${st[0]}</span><small>${busy?esc(TORMSG[c.cc]||''):L?'پورت محلی '+L.port:''}</small></div>
+ <div class="c4 acts"><button class="s" ${busy?'disabled':''} onclick="torTest('${c.cc}')">تست پینگ واقعی</button><button class="p" onclick="torNewInb('${c.cc}')">ساخت لوکیشن</button>
+ ${L?`<button class="s" ${busy?'disabled':''} onclick="torRestart('${c.cc}')">ری‌استارت</button>${L.users.length?'':`<button class="s d" ${busy?'disabled':''} onclick="torDel('${c.cc}')">حذف</button>`}`:''}</div></div>`}
+function torBody(){
+ if(!TOR)return '<div class="empty">در حال بارگذاری…</div>';
+ const rows=torRows();
+ const head=!TOR.installed?'<div class="b warn" style="margin-bottom:10px;display:block">Tor روی این سرور نصب نیست؛ هنگام ساخت اولین لوکیشن خودکار نصب می‌شود (حدود یک دقیقه). هر کشور فعال حدود '+TOR.mem_mb+' مگابایت رم مصرف می‌کند.</div>':'';
+ if(!rows.length)return head+'<div class="empty">کشوری پیدا نشد.</div>';
+ return head+`<div class="cl">${rows.map(torRow).join('')}</div>`}
+async function torJob(id,on){for(;;){await new Promise(r=>setTimeout(r,1500));const j=await api('/tor/job/'+id);if(on)on(j.msg);if(j.state==='done')return j;if(j.state==='error')throw new Error(j.error||'خطا')}}
+async function torTest(cc){TORBUSY[cc]=1;TORMSG[cc]='شروع تست…';torPaint();
+ try{const r=await api('/tor/'+cc+'/test','POST');const j=await torJob(r.job,m=>{TORMSG[cc]=m;torPaint()});TORTEST[cc]=j.res;toast(`پینگ واقعی از مسیر Tor: ${j.res.ms}ms`)}
+ catch(e){toast(e.message,1)}finally{delete TORBUSY[cc];torLoad()}}
+async function torRestart(cc){TORBUSY[cc]=1;TORMSG[cc]='ری‌استارت…';torPaint();
+ try{const r=await api('/tor/'+cc+'/restart','POST');await torJob(r.job,m=>{TORMSG[cc]=m;torPaint()});toast('ری‌استارت شد')}catch(e){toast(e.message,1)}finally{delete TORBUSY[cc];torLoad()}}
+async function torDel(cc){if(!confirm('این لوکیشن Tor حذف شود؟ (سرویس Tor این کشور متوقف و پاک می‌شود)'))return;
+ try{await api('/tor/'+cc,'DELETE');toast('حذف شد')}catch(e){toast(e.message,1)}torLoad()}
+async function torScan(){try{await api('/tor/scan','POST');toast('اسکن شروع شد؛ چند ثانیه صبر کنید')}catch(e){toast(e.message,1)}torLoad()}
+function torNewInb(cc){
+ const c=torC().find(x=>x[0]==cc)||[cc,cc.toUpperCase(),''];
+ const used=new Set(S.inbounds.map(i=>+i.port)),names=new Set(S.inbounds.map(i=>i.name));
+ let port=443;for(const t of [443,8443,2053,2083,2087,2096,8880,2052,2082]){if(!used.has(t)){port=t;break}}
+ if(used.has(port)){port=10000+Math.floor(Math.random()*50000)}
+ let nm='tor-'+cc,n=2;while(names.has(nm))nm='tor-'+cc+(n++);
+ newInb({proto:'vless',name:nm,remark:`${c[2]} ${c[1]} (Tor)`.trim(),port,x_exit:'tor:'+cc,x_security:'reality',x_flow:'xtls-rprx-vision'});
+ const e=$('#f_port');if(e)e.value=port}
+function torBridgeModal(){
+ const m=modal(`<h2>Bridge (فقط اگر Tor روی سرور شما فیلتر است)</h2><div class="fg"><label>هر خط یک bridge (obfs4 یا ساده)</label><textarea id="tb_t" dir="ltr" spellcheck="false" style="min-height:150px" placeholder="obfs4 1.2.3.4:443 FINGERPRINT cert=... iat-mode=0">${esc(TOR?TOR.bridges:'')}</textarea>
+ <small>اگر سرور شما خارج از ایران است و Tor مستقیم وصل می‌شود، این بخش را خالی بگذارید. Bridge را از bridges.torproject.org بگیرید. با ذخیره، روی همهٔ لوکیشن‌های فعال اعمال و Tor آن‌ها ری‌استارت می‌شود.</small></div>
+ <div class="mfoot"><button class="s" id="tb_c">بستن</button><button class="p" id="tb_s">ذخیره و اعمال</button></div>`);
+ m.querySelector('#tb_c').onclick=()=>m.remove();
+ m.querySelector('#tb_s').onclick=async()=>{try{const r=await api('/tor/bridges','PUT',{bridges:m.querySelector('#tb_t').value});toast('در حال اعمال…');m.remove();await torJob(r.job);toast('Bridgeها اعمال شد');torLoad()}catch(e){toast(e.message,1)}}}
 /* ---------- تانل (BackPack) ---------- */
 let TUN=null,TUNT=null;
 const TPH={online:['آنلاین','ok'],ready:['برقرار شد','warn'],down:['قطع','bad']};
@@ -6524,7 +7244,7 @@ function nodProg(m,job){const box=m.querySelector('#ndF');m.querySelector('#nd_s
   if(d.state=='run')setTimeout(loop,1500);else load()};loop()}
 /* ---------- اینباندها ---------- */
 function inbHTML(){return `<div class="bar2"><span></span><button class="p" onclick="newInb()">+ اینباند جدید</button></div>`+
- (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.proto==='ss'?' <span class="tag">Shadowsocks</span>':''}${i.proto==='trojan'?' <span class="tag">Trojan</span>':''}${(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')&&i.xcfg&&i.xcfg.custom_sub?' <span class="tag">ساب کاستوم</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}</h3>
+ (S.inbounds.map(i=>`<article class="card ${i.up?'up':''}"><div class="row"><h3>${esc(i.name)}<small>${esc(i.remark)}</small>${i.awg?' <span class="tag">AmneziaWG</span>':''}${i.proto==='l2tp'?' <span class="tag">L2TP/IPsec</span>':''}${i.proto==='ovpn'?' <span class="tag">OpenVPN</span>':''}${i.proto==='vless'?' <span class="tag">VLESS</span>':''}${i.proto==='ss'?' <span class="tag">Shadowsocks</span>':''}${i.proto==='trojan'?' <span class="tag">Trojan</span>':''}${(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')&&i.xcfg&&i.xcfg.custom_sub?' <span class="tag">ساب کاستوم</span>':''}${i.node_id?` <span class="tag">نود: ${esc(nodName(i.node_id))}</span>`:''}${i.exclude_sub?' <span class="tag">خارج از ساب</span>':''}${i.xcfg&&i.xcfg.exit?` <span class="tag">${esc(String(i.xcfg.exit).replace('tor:','Tor '))}</span>`:''}</h3>
  <span class="b ${i.enabled?(i.up?'ok':'warn'):''}">${i.enabled?(i.up?'بالا':'پایین (خطا؟)'):'غیرفعال'}</span></div>
  <div class="meta"><span>پورت: <b>${i.proto==='l2tp'?'500, 4500/udp':i.proto==='ovpn'?i.port+'/'+esc(i.ovpn.transport):(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')?i.port+'/'+i.net:i.port+'/udp'}</b></span>${(i.proto==='vless'||i.proto==='ss'||i.proto==='trojan')?'':`<span>IPv4: <b>${esc(i.address4)}</b></span>`}${i.address6?`<span>IPv6: <b>${esc(i.address6)}</b></span>`:''}
  <span>Endpoint: <b>${esc(i.endpoint||'(آدرس پنل)')}${i.endpoint_port?':'+i.endpoint_port:''}</b></span><span>DNS: <b>${esc(i.dns||'—')}</b></span>
@@ -6574,6 +7294,7 @@ const INB=[{s:'اصلی',tab:'پایه'},
  {k:'address6',l:'آدرس سرور IPv6 (اختیاری)',ph:'fd42:42:0::1/64',h:'خالی = بدون IPv6',p:'wg'},
  {k:'private_key',l:'کلید خصوصی سرور',h:'خالی = ساخت خودکار (در ویرایش: خالی = بدون تغییر)',p:'wg'},
  {k:'regen_keys',l:'ساخت دوباره کلید سرور / CA (کلاینت‌ها باید کانفیگ جدید بگیرند)',t:'check',edit:1,p:'wg ovpn vless ss trojan'},
+ {k:'x_exit',l:'خروجی ترافیک (لوکیشن)',t:'select',p:'vless ss trojan',w:'node_id=0',opts:()=>[['','مستقیم از همین سرور (پیش‌فرض)'],...torC().map(([c,n,f])=>['tor:'+c,`${f} Tor — خروج از ${n}`])],h:'Tor: ترافیک کاربران از شبکهٔ Tor و با آی‌پی خروجی همان کشور می‌رود (روی همین سرور، بدون سرور دیگر). فقط TCP کار می‌کند (UDP/QUIC بلاک می‌شود) و سرعت کمتر/پینگ بیشتر است. برای دیدن پینگ کشورها به تب «Tor» بروید.'},
  {s:'اتصال کلاینت‌ها',tab:'اتصال'},
  {k:'endpoint',l:'آدرس عمومی سرور (Endpoint)',h:'IP یا دامنه. خالی = همان آدرسی که پنل با آن باز شده'},
  {k:'endpoint_port',l:'پورت Endpoint',t:'number',h:'۰ = همان پورت listen (برای پورت‌فوروارد/NAT/CDN). در VLESS/Shadowsocks: پورتی که داخل لینک کلاینت می‌آید',p:'wg ovpn vless ss trojan'},
